@@ -1,0 +1,13 @@
+{
+  "name": "minecraft-ctf-local-bots",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local-only Mineflayer smoke clients for MinecraftCTF",
+  "main": "local_bot_test.js",
+  "scripts": {"smoke": "node local_bot_test.js"},
+  "dependencies": {
+    "mineflayer": "^4.31.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.1.10"
+  }
+}

@@ -1,0 +1,140 @@
+const http = require('node:http');
+const fs = require('node:fs/promises');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { spawn } = require('node:child_process');
+
+const port = Number(process.env.CTF_VIEWER_PORT || 3000);
+if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('CTF_VIEWER_PORT must be between 1024 and 65535');
+const root = path.resolve(__dirname, '..');
+const snapshotPath = path.join(root, 'server', 'plugins', 'MinecraftCTF', 'viewer-state.json');
+const assets = new Map([
+  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/styles.css', ['styles.css', 'text/css; charset=utf-8']]
+]);
+const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
+const token = crypto.randomBytes(24).toString('hex');
+const clients = new Set();
+let snapshot = null;
+let demo = { status: 'idle', message: '' };
+let demoProcess = null;
+let previousMessage = '';
+let reading = false;
+
+function currentState() {
+  return {
+    connected: !!snapshot && snapshot.online === true && Date.now() - snapshot.updatedAt < 3000,
+    snapshot,
+    demo
+  };
+}
+
+function broadcast() {
+  const message = JSON.stringify(currentState());
+  if (message === previousMessage) return;
+  previousMessage = message;
+  for (const client of clients) client.write(`data: ${message}\n\n`);
+}
+
+async function refresh() {
+  if (reading) return;
+  reading = true;
+  try {
+    const candidate = JSON.parse(await fs.readFile(snapshotPath, 'utf8'));
+    if (candidate.schemaVersion === 1 && Number.isFinite(candidate.updatedAt)) snapshot = candidate;
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'EPERM' && !(error instanceof SyntaxError)) console.error(`Snapshot read failed: ${error.message}`);
+  } finally {
+    reading = false;
+    broadcast();
+  }
+}
+
+function json(response, status, data) {
+  response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  response.end(JSON.stringify(data));
+}
+
+function startDemo() {
+  let output = '';
+  demo = { status: 'running', message: '机器人正在连接本地 Paper…' };
+  demoProcess = spawn(process.execPath, [path.join(root, 'bot-test', 'local_bot_test.js')], {
+    cwd: path.join(root, 'bot-test'),
+    windowsHide: true,
+    env: { ...process.env, CTF_HOST: '127.0.0.1', CTF_PORT: '25565', CTF_BOTS: '2', CTF_PLAYERS: '1', CTF_ACTIVE_TEAM: 'both' },
+    stdio: ['ignore', 'pipe', 'pipe']
+  });
+  const collect = chunk => { output = (output + chunk.toString()).slice(-16000); };
+  demoProcess.stdout.on('data', collect);
+  demoProcess.stderr.on('data', collect);
+  demoProcess.on('error', error => {
+    demo = { status: 'failed', message: error.message };
+    demoProcess = null;
+    broadcast();
+  });
+  demoProcess.on('close', code => {
+    const summary = output.split(/\r?\n/).findLast(line => line.includes('[smoke]'));
+    demo = { status: code === 0 ? 'succeeded' : 'failed', message: summary || `机器人已退出，状态码 ${code}` };
+    demoProcess = null;
+    broadcast();
+  });
+  broadcast();
+}
+
+const server = http.createServer(async (request, response) => {
+  response.setHeader('Cache-Control', 'no-store');
+  response.setHeader('X-Content-Type-Options', 'nosniff');
+  response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
+  if (!allowedHosts.has(request.headers.host)) return json(response, 403, { error: 'Local viewer host required' });
+  const pathname = new URL(request.url, `http://127.0.0.1:${port}`).pathname;
+  if (pathname === '/api/demo' && request.method === 'POST') {
+    const origin = request.headers.origin;
+    if (!origin || ![...allowedHosts].some(host => origin === `http://${host}`) || request.headers['x-viewer-token'] !== token)
+      return json(response, 403, { error: '请从本机 viewer 页面启动演示。' });
+    const state = currentState();
+    if (!state.connected) return json(response, 409, { error: 'Paper 尚未连接，请先启动更新后的服务端。' });
+    if (demoProcess || snapshot.phase === 'running') return json(response, 409, { error: '已有比赛或演示正在进行。' });
+    startDemo();
+    return json(response, 202, { ok: true });
+  }
+  if (request.method !== 'GET') return json(response, 405, { error: 'Method not allowed' });
+  if (pathname === '/api/session') return json(response, 200, { token });
+  if (pathname === '/api/state') return json(response, 200, currentState());
+  if (pathname === '/api/stream') {
+    if (clients.size >= 16) return json(response, 503, { error: 'Too many viewer connections' });
+    response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+    response.write(`data: ${JSON.stringify(currentState())}\n\n`);
+    clients.add(response);
+    request.on('close', () => clients.delete(response));
+    return;
+  }
+  const asset = assets.get(pathname);
+  if (!asset) return json(response, 404, { error: 'Not found' });
+  try {
+    const body = await fs.readFile(path.join(__dirname, 'public', asset[0]));
+    response.writeHead(200, { 'Content-Type': asset[1] });
+    response.end(body);
+  } catch (error) {
+    console.error(error.message);
+    json(response, 500, { error: 'Viewer asset unavailable' });
+  }
+});
+
+const refreshTimer = setInterval(refresh, 250);
+const heartbeatTimer = setInterval(() => { for (const client of clients) client.write(': heartbeat\n\n'); }, 10000);
+server.on('error', error => { console.error(error.message); process.exitCode = 1; clearInterval(refreshTimer); clearInterval(heartbeatTimer); });
+server.listen(port, '127.0.0.1', () => {
+  console.log(`MinecraftCTF viewer: http://127.0.0.1:${port}`);
+  console.log(`Authoritative state: ${snapshotPath}`);
+  refresh();
+});
+
+function shutdown() {
+  clearInterval(refreshTimer); clearInterval(heartbeatTimer);
+  if (demoProcess) demoProcess.kill();
+  for (const client of clients) client.end();
+  server.close();
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);

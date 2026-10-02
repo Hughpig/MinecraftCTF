@@ -1,0 +1,6 @@
+# MinecraftCTF runtime configuration
+# The fixed MVP currently uses the built-in arena definition.
+map-mode: fixed
+match-seconds: 180
+max-team-size: 16
+flags-per-team: 8

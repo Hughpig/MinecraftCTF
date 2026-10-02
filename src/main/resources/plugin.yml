@@ -1,0 +1,13 @@
+name: MinecraftCTF
+version: 0.1.0
+main: com.minecraftctf.CtfPlugin
+api-version: '1.21'
+author: Local MVP
+description: Fixed-map 3v3 Minecraft CTF rules server
+commands:
+  ctf:
+    description: Manage the local 3v3 CTF match
+    usage: /ctf <setup|join|ready|start|stop|status>
+permissions:
+  minecraftctf.admin:
+    default: op

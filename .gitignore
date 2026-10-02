@@ -1,0 +1,57 @@
+# Java / Maven
+target/
+.mvn/
+*.class
+
+# Node.js
+node_modules/
+bot-test/node_modules/
+viewer/node_modules/
+npm-debug.log*
+
+# Local Paper runtime and generated worlds
+server/paper-*.jar
+server/libraries/
+server/versions/
+server/cache/
+server/ctf_arena/
+server/world/
+server/world_nether/
+server/world_the_end/
+server/logs/
+server/plugins/bStats/
+server/plugins/spark/
+server/plugins/MinecraftCTF/
+server/plugins/minecraft-ctf.jar
+server/*.log
+server/*.pid
+server/usercache.json
+server/whitelist.json
+server/ops.json
+server/banned-ips.json
+server/banned-players.json
+server/session.lock
+
+# Local viewer and smoke-test logs
+viewer/*.log
+viewer/*-error.log
+bot-test/*.log
+bot-test/*-error.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db
+
+cache/
+server/eula.txt
+server/bukkit.yml
+server/commands.yml
+server/config/
+server/help.yml
+server/permissions.yml
+server/plugins/
+server/spigot.yml
+server/version_history.json

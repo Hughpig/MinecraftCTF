@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MinecraftCTF · 实时观战</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">⚑</span><div><h1>Minecraft<span>CTF</span></h1><p>本地赛场 · LIVE ARENA</p></div></div>
+      <div class="connection"><span id="connection-dot" class="status-dot"></span><span id="connection-text">连接服务端…</span><span class="local-tag">LOCAL ONLY</span></div>
+    </header>
+    <section class="scoreboard" aria-label="实时比分">
+      <div class="team-score red"><div><span class="team-kicker">LEFT TEAM</span><h2><span class="team-dot"></span>红队</h2></div><div class="score-number"><strong id="left-score">0</strong><span>/ 8</span></div><div id="left-progress" class="capture-progress" aria-label="红队插旗进度"></div></div>
+      <div class="match-clock"><span id="phase" class="phase">等待比赛</span><strong id="timer">03:00</strong><span id="result-text">180 秒 · 插满 8 旗获胜</span></div>
+      <div class="team-score blue"><div><span class="team-kicker">RIGHT TEAM</span><h2><span class="team-dot"></span>蓝队</h2></div><div class="score-number"><strong id="right-score">0</strong><span>/ 8</span></div><div id="right-progress" class="capture-progress" aria-label="蓝队插旗进度"></div></div>
+    </section>
+    <main class="main-grid">
+      <section class="arena-panel" aria-label="地图 viewer">
+        <div class="arena-toolbar">
+          <div id="perspective-badge" class="perspective-badge red"><span class="team-dot"></span><strong id="perspective-title">红队视角 (RED)</strong><span class="spectator-tag">观战</span></div>
+          <div class="view-controls"><div class="segmented" aria-label="选择观战视角"><button id="red-view" class="active" aria-pressed="true">红队</button><button id="blue-view" aria-pressed="false">蓝队</button></div><label class="labels-toggle"><input id="show-labels" type="checkbox" checked>显示名字</label></div>
+        </div>
+        <div class="map-frame">
+          <canvas id="arena" aria-label="二维俯视实时赛场：圆点为玩家，方块为旗，金色方框为目标点。">当前浏览器无法显示地图。</canvas>
+          <div id="map-overlay" class="map-overlay"><span class="overlay-icon">⚑</span><h3 id="overlay-title">等待服务端数据</h3><p id="overlay-text">先启动 Paper，再开始一场演示比赛。</p></div>
+          <div id="hover-info" class="hover-info" hidden></div>
+        </div>
+        <div class="map-footer"><div class="legend"><span><i class="legend-player"></i>玩家</span><span><i class="legend-flag"></i>旗座</span><span><i class="legend-target"></i>目标点</span><span><i class="legend-locked"></i>已插旗</span><span><i class="legend-wall"></i>墙 / 监狱</span><span><i class="legend-plate"></i>释放板</span></div><span class="map-scale">1 格 = 1 方块</span></div>
+        <div class="arena-caption"><span>固定地图 · 49 × 73</span><span id="snapshot-age">等待快照</span><span>服务端权威状态 · 4 Hz</span></div>
+      </section>
+      <aside class="sidebar">
+        <section class="side-card demo-card"><span class="section-kicker">QUICK START</span><h2>看一场夺旗</h2><p>红蓝双方同时夺旗，被抓后等待获释再继续。直接观察真实对局。</p><button id="start-demo" class="primary-button" disabled><span aria-hidden="true">▶</span>开始演示局</button><p id="demo-status" class="demo-status" role="status">正在连接 Paper…</p></section>
+        <section class="side-card players-card"><div class="section-heading"><h2>场上玩家</h2><span id="player-count" class="count-tag">0</span></div><div id="player-list" class="player-list"><p class="empty-message">暂无玩家进入赛场</p></div></section>
+        <section class="side-card events-card"><div class="section-heading"><h2>比赛动态</h2><span class="live-label">LIVE</span></div><div id="event-list" class="event-list"><p class="empty-message">等待开局事件</p></div></section>
+        <div class="spectator-note"><span aria-hidden="true">◉</span><p>这是俯视观战工具，不是完整 Minecraft 客户端。切换视角不会改变队伍或规则。</p></div>
+      </aside>
+    </main>
+    <footer class="page-footer"><span>MINECRAFT CTF / LOCAL MVP</span><span>旗位、目标点和障碍物来自当前地图，不生成虚构场景。</span></footer>
+  </div>
+</body>
+</html>

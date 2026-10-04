@@ -8,6 +8,7 @@ node_modules/
 bot-test/node_modules/
 viewer/node_modules/
 npm-debug.log*
+/logs/
 
 # Local Paper runtime and generated worlds
 server/paper-*.jar
@@ -25,6 +26,7 @@ server/plugins/MinecraftCTF/
 server/plugins/minecraft-ctf.jar
 server/*.log
 server/*.pid
+server/.console_history
 server/usercache.json
 server/whitelist.json
 server/ops.json

@@ -1,0 +1,20 @@
+{
+  "name": "minecraft-ctf-original-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Original Mineflayer CTF bot adapted for the local MinecraftCTF Paper server",
+  "main": "ctf_bot.js",
+  "scripts": {
+    "bot": "node ctf_bot.js",
+    "walk": "node scripts/run-local-bots.js",
+    "local-3v3": "node scripts/run-local-bots.js",
+    "walk-smart": "node scripts/run-walk-smart.js",
+    "free-mover": "node scripts/run-free-mover.js"
+  },
+  "dependencies": {
+    "minecraft-protocol": "^1.68.0",
+    "mineflayer": "^4.31.0",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.1.10"
+  }
+}

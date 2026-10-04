@@ -125,7 +125,7 @@ Game over!
 ```text
 x = -24..24
 z = -36..36
-中央分界线：x = 0
+中央标记线：x = 0（可通行）
 地面高度：Y = 64
 ```
 
@@ -196,6 +196,53 @@ npm run smoke
 
 成功时会在终端输出 `PASS`，并且服务端事件日志中应出现 `flag_pickup`、`flag_capture` 和 `match_end`。
 
+## 运行简易 3v3 bot
+
+根目录的 `ctf_bot.js` 是用于观察 viewer 流畅度的简易协议 bot：每个 bot 开局直接寻找当前最近的敌方旗，拿旗后返回最近的己方空目标点。它不加载区块、不运行 Mineflayer 物理模拟，也不做扫描、敌人预测或高频战术决策。首次运行先在仓库根目录安装依赖：
+
+```powershell
+npm install
+```
+
+启动 Paper 后，运行一场本地 `3v3`：
+
+```powershell
+npm run walk
+```
+
+`walk` 是当前保持走路速度的基线版本；`npm run local-3v3` 仍保留为兼容别名。
+
+启动单个 bot：
+
+```powershell
+$env:CTF_LOCAL = 1
+$env:CTF_HOST = '127.0.0.1'
+$env:CTF_VERSION = '1.21.8'
+node .\ctf_bot.js Striker SimpleCTF_0
+```
+
+可覆盖 `CTF_HOST`、`CTF_PORT`、`CTF_BOTS`、`CTF_PLAYERS` 和 `CTF_ACTIVE_TEAM`。本地 `3v3` 启动器使用已验证的 Mineflayer smoke runner 创建 6 个 bot，要求服务端当前没有正在进行的比赛。
+
+### walk-smart 演示版本
+
+如果要观察带基础分工和躲闪的步行 bot，可运行：
+
+```powershell
+npm run walk-smart
+```
+
+默认启动 6 个 bot 进行 3v3：每队第一个 bot 在己方目标区巡逻防守，另外两个 bot 分摊进攻旗帜路线；移动速度仍是走路速度，遇到已知对方 bot 接近时会做短暂侧向躲闪。
+
+## 单队自由移动 viewer 测试
+
+如果只想验证 Paper、插件状态快照和 viewer 的连续移动，可以启动一名不抢旗的单队移动 bot：
+
+```powershell
+npm run free-mover
+```
+
+它会自动加入左队，依次执行直线、往返、圆周和圆弧轨迹，约 1 分钟后退出。若服务端还没有固定地图，可先设置 `$env:CTF_MOVER_SETUP = 1` 再运行。
+
 ## 事件和状态文件
 
 运行时生成文件不会纳入 Git：
@@ -222,7 +269,7 @@ match_end
 ## 架构说明
 
 ```text
-Minecraft Java 客户端 / Mineflayer bot
+Minecraft Java 客户端 / 轻量协议 bot
                  │真实 Minecraft 协议
                  ▼
        Paper 1.21.8 服务端

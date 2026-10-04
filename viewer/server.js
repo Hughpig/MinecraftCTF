@@ -19,7 +19,8 @@ const clients = new Set();
 let snapshot = null;
 let demo = { status: 'idle', message: '' };
 let demoProcess = null;
-let previousMessage = '';
+let previousState = null;
+let previousSnapshot = '';
 let reading = false;
 
 function currentState() {
@@ -31,9 +32,10 @@ function currentState() {
 }
 
 function broadcast() {
-  const message = JSON.stringify(currentState());
-  if (message === previousMessage) return;
-  previousMessage = message;
+  const state = currentState();
+  if (previousState && state.connected === previousState.connected && state.snapshot === previousState.snapshot && state.demo === previousState.demo) return;
+  previousState = state;
+  const message = JSON.stringify(state);
   for (const client of clients) client.write(`data: ${message}\n\n`);
 }
 
@@ -41,8 +43,14 @@ async function refresh() {
   if (reading) return;
   reading = true;
   try {
-    const candidate = JSON.parse(await fs.readFile(snapshotPath, 'utf8'));
-    if (candidate.schemaVersion === 1 && Number.isFinite(candidate.updatedAt)) snapshot = candidate;
+    const content = await fs.readFile(snapshotPath, 'utf8');
+    if (content !== previousSnapshot) {
+      const candidate = JSON.parse(content);
+      if (candidate.schemaVersion === 1 && Number.isFinite(candidate.updatedAt)) {
+        snapshot = candidate;
+        previousSnapshot = content;
+      }
+    }
   } catch (error) {
     if (error.code !== 'ENOENT' && error.code !== 'EPERM' && !(error instanceof SyntaxError)) console.error(`Snapshot read failed: ${error.message}`);
   } finally {
@@ -121,7 +129,7 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-const refreshTimer = setInterval(refresh, 250);
+const refreshTimer = setInterval(refresh, 100);
 const heartbeatTimer = setInterval(() => { for (const client of clients) client.write(': heartbeat\n\n'); }, 10000);
 server.on('error', error => { console.error(error.message); process.exitCode = 1; clearInterval(refreshTimer); clearInterval(heartbeatTimer); });
 server.listen(port, '127.0.0.1', () => {

@@ -74,6 +74,7 @@ h1 span { color: var(--red); }
 .legend-locked { background: linear-gradient(90deg, var(--red) 50%, var(--blue) 50%); border: 1px solid #d5ab2e; }
 .legend-wall { background: #363b44; }
 .legend-plate { background: #e2bd88; transform: rotate(45deg); width: 6px !important; height: 6px !important; }
+.legend-center { background: #8c939d; width: 2px !important; height: 11px !important; }
 .map-scale { color: #9ba4b0; font-size: 10px; white-space: nowrap; }
 .arena-caption { display: flex; justify-content: space-between; gap: 8px; color: #9aa3b0; background: #fafbfc; padding: 9px 17px; border-top: 1px solid #f0f2f5; font-size: 10px; }
 .sidebar { display: flex; flex-direction: column; gap: 15px; }

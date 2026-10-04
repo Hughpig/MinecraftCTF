@@ -3,8 +3,8 @@ const { Vec3 } = require('vec3');
 
 const HOST = process.env.CTF_HOST || '127.0.0.1';
 const PORT = Number(process.env.CTF_PORT || 25565);
-const BOT_COUNT = Math.max(1, Math.min(16, Number(process.env.CTF_BOTS || 2)));
-const PLAYERS_PER_TEAM = Math.max(1, Math.min(16, Number(process.env.CTF_PLAYERS || 1)));
+const BOT_COUNT = Math.max(1, Math.min(16, Number(process.env.CTF_BOTS || 6)));
+const PLAYERS_PER_TEAM = Math.max(1, Math.min(16, Number(process.env.CTF_PLAYERS || 3)));
 const ACTIVE_TEAM = process.env.CTF_ACTIVE_TEAM || 'both';
 const MATCH = `match team:local-bots enemy:bot players:${PLAYERS_PER_TEAM} map:fixed`;
 const FLAG_APPROACH_OFFSET = 1.25;
@@ -21,7 +21,7 @@ const log = (name, message) => console.log(`[${new Date().toISOString()}] [${nam
 function makeBot(index) {
   const username = `LocalCTF_${index + 1}`;
   const bot = mineflayer.createBot({ host: HOST, port: PORT, username, auth: 'offline', version: '1.21.8' });
-  bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, pickups: 0, captures: 0 };
+  bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, pickups: 0, captures: 0, opponents: new Set() };
 
   bot.once('spawn', async () => {
     log(username, `connected to ${HOST}:${PORT}`);
@@ -44,16 +44,20 @@ function makeBot(index) {
         if (bot.ctf.team) {
           bot.ctf.teamIndex = teams[bot.ctf.team].indexOf(username);
           bot.ctf.teamSize = teams[bot.ctf.team].length;
+          bot.ctf.role = bot.ctf.teamIndex === 0 ? 'defender' : 'attacker';
+          bot.ctf.opponents = new Set(teams[bot.ctf.team === 'left' ? 'right' : 'left']);
         }
         if (bot.ctf.team && !bot.ctf.started) {
           bot.ctf.started = true;
           if (ACTIVE_TEAM === 'both' || ACTIVE_TEAM === bot.ctf.team) {
-            runRoute(bot).catch(err => {
+            runSmartRoute(bot).catch(async err => {
               bot.ctf.routeFailed = true;
               bot.clearControlStates();
-              log(username, `route error; waiting for match end: ${err.stack || err}`);
+              log(username, `route error; starting recovery: ${err.stack || err}`);
+              await recoverRoute(bot);
             });
           }
+          log(username, `smart role=${bot.ctf.role} teamIndex=${bot.ctf.teamIndex}`);
         }
       } catch (err) {
         log(username, `cannot parse game start: ${err.message}`);
@@ -78,7 +82,49 @@ function makeBot(index) {
   bots.push(bot);
 }
 
-async function goNear(bot, x, z, completed = () => false) {
+function nearestOpponent(bot, position, maxDistance = 3.5) {
+  let nearest = null;
+  let nearestDistance = maxDistance;
+  for (const entity of Object.values(bot.entities || {})) {
+    if (entity.type !== 'player' || !entity.username || !bot.ctf.opponents.has(entity.username)) continue;
+    const distance = Math.hypot(entity.position.x - position.x, entity.position.z - position.z);
+    if (distance < nearestDistance && Math.abs(entity.position.y - position.y) <= 2.5) {
+      nearest = entity;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+function entityByUsername(bot, username) {
+  return Object.values(bot.entities || {}).find(entity => entity.type === 'player' && entity.username === username) || null;
+}
+
+function homeSign(bot) {
+  return bot.ctf.team === 'left' ? -1 : 1;
+}
+
+function isHomeHalf(bot, position) {
+  return !!position && position.x * homeSign(bot) > 1;
+}
+
+function nearestHomeOpponent(bot, maxDistance = 96) {
+  if (!bot.entity || !bot.ctf.team) return null;
+  let nearest = null;
+  let nearestDistance = maxDistance;
+  for (const entity of Object.values(bot.entities || {})) {
+    if (entity.type !== 'player' || !entity.username || !bot.ctf.opponents.has(entity.username)) continue;
+    if (!isHomeHalf(bot, entity.position)) continue;
+    const distance = Math.hypot(entity.position.x - bot.entity.position.x, entity.position.z - bot.entity.position.z);
+    if (distance < nearestDistance && Math.abs(entity.position.y - bot.entity.position.y) <= 2.5) {
+      nearest = entity;
+      nearestDistance = distance;
+    }
+  }
+  return nearest;
+}
+
+async function goNear(bot, x, z, completed = () => false, options = {}) {
   bot.clearControlStates();
   let started = Date.now();
   let lastLog = 0;
@@ -87,8 +133,13 @@ async function goNear(bot, x, z, completed = () => false) {
   let lastProgress = Date.now();
   let nudgeUntil = 0;
   let nudgeLeft = false;
+  let dodgeUntil = 0;
+  let dodgeLeft = false;
+  let dodgingOpponent = '';
+  const maxDuration = options.maxDuration || 20000;
+  const dodgePlayers = options.dodgePlayers !== false;
   const target = new Vec3(x, 64, z);
-  while (!stopping && Date.now() - started < 20000) {
+  while (!stopping && Date.now() - started < maxDuration) {
     if (completed()) { bot.clearControlStates(); return true; }
     if (bot.ctf.jailed) {
       bot.clearControlStates();
@@ -111,11 +162,18 @@ async function goNear(bot, x, z, completed = () => false) {
       nudgeUntil = Date.now() + 550;
       lastProgress = Date.now();
     }
+    const opponent = dodgePlayers ? nearestOpponent(bot, position) : null;
+    if (opponent && (opponent.username !== dodgingOpponent || dodgeUntil <= Date.now())) {
+      dodgingOpponent = opponent.username;
+      dodgeLeft = (Math.floor(position.x * 10) + Math.floor(position.z * 10) + opponent.username.length) % 2 === 0;
+      dodgeUntil = Date.now() + 550;
+    }
     await bot.lookAt(new Vec3(target.x, position.y + 1.62, target.z), true);
     bot.setControlState('forward', true);
     bot.setControlState('sprint', false);
-    bot.setControlState('left', nudgeUntil > Date.now() && nudgeLeft);
-    bot.setControlState('right', nudgeUntil > Date.now() && !nudgeLeft);
+    const dodging = dodgeUntil > Date.now();
+    bot.setControlState('left', dodging ? dodgeLeft : nudgeUntil > Date.now() && nudgeLeft);
+    bot.setControlState('right', dodging ? !dodgeLeft : nudgeUntil > Date.now() && !nudgeLeft);
     const ahead = bot.blockAt(position.offset(deltaX / Math.max(distance, 0.01) * 0.8, 0.1, deltaZ / Math.max(distance, 0.01) * 0.8));
     // Do not jump during the final approach to a flag/target. The server confirms
     // a pickup before the client reaches the block, so jumping here only makes the
@@ -179,6 +237,28 @@ async function leavePrison(bot) {
   await goNear(bot, doorX, 23.5);
 }
 
+async function chaseHomeOpponent(bot) {
+  let lastTarget = '';
+  while (!stopping && !bot.ctf.jailed) {
+    const opponent = nearestHomeOpponent(bot);
+    if (!opponent) return;
+    if (opponent.username !== lastTarget) {
+      lastTarget = opponent.username;
+      log(bot.username, `defend chase ${opponent.username}`);
+    }
+    const targetId = opponent.entityId;
+    try {
+      await goNear(bot, opponent.position.x, opponent.position.z, () => {
+        const current = entityByUsername(bot, opponent.username);
+        return !current || current.entityId !== targetId || !isHomeHalf(bot, current.position) || bot.ctf.jailed;
+      }, { dodgePlayers: false, maxDuration: 3000 });
+    } catch (_) {
+      bot.clearControlStates();
+      await sleep(100);
+    }
+  }
+}
+
 async function patrolAfterRoute(bot) {
   const homeSign = bot.ctf.team === 'left' ? -1 : 1;
   const waypoints = [
@@ -194,14 +274,57 @@ async function patrolAfterRoute(bot) {
   }
 }
 
-async function runRoute(bot) {
+async function runDefenderRoute(bot) {
+  const sign = homeSign(bot);
+  const waypoints = [
+    [sign * 8, -30], [sign * 8, -6],
+    [sign * 3, -6], [sign * 3, -30]
+  ];
+  let index = 0;
+  while (!stopping) {
+    await waitForRelease(bot);
+    await leavePrison(bot);
+    const [x, z] = waypoints[index++ % waypoints.length];
+    await goNear(bot, x, z, () => !!nearestHomeOpponent(bot));
+    if (nearestHomeOpponent(bot)) await chaseHomeOpponent(bot);
+  }
+}
+
+async function recoverRoute(bot) {
+  if (stopping) return;
+  try {
+    await waitForRelease(bot);
+    await leavePrison(bot);
+    const sign = homeSign(bot);
+    const currentZ = bot.entity ? Math.max(-30, Math.min(30, bot.entity.position.z)) : 0;
+    const recoveryPoints = [
+      [sign * 2, currentZ],
+      [sign * 2, -30],
+      [sign * 2, -6],
+      [sign * 4, -30],
+      [sign * 4, -6]
+    ];
+    for (const [x, z] of recoveryPoints) {
+      if (stopping || !bot.entity || isHomeHalf(bot, bot.entity.position)) break;
+      try { await goNear(bot, x, z, () => false, { maxDuration: 7000 }); } catch (_) { bot.clearControlStates(); }
+    }
+    if (!stopping) await patrolAfterRoute(bot);
+  } catch (recoveryError) {
+    bot.clearControlStates();
+    log(bot.username, `recovery error: ${recoveryError.stack || recoveryError}`);
+  }
+}
+
+async function runAttackerRoute(bot) {
   if (bot.ctf.routeRunning) return;
   bot.ctf.routeRunning = true;
   const left = bot.ctf.team === 'left';
   const homeSign = left ? -1 : 1;
   const zs = [-30, -22, -14, -6];
-  const routeOrder = (left ? [0, 1, 2, 3, 4, 5, 6, 7] : [1, 2, 3, 0, 5, 6, 7, 4])
-    .filter((_, routePosition) => routePosition % bot.ctf.teamSize === bot.ctf.teamIndex);
+  const fullRoute = left ? [0, 1, 2, 3, 4, 5, 6, 7] : [1, 2, 3, 0, 5, 6, 7, 4];
+  const attackerIndex = Math.max(0, bot.ctf.teamIndex - 1);
+  const attackerCount = Math.max(1, bot.ctf.teamSize - 1);
+  const routeOrder = fullRoute.filter((_, routePosition) => routePosition % attackerCount === attackerIndex);
   for (const routeIndex of routeOrder) {
     if (stopping) break;
     const flagIndex = routeIndex < 4 ? routeIndex + 4 : routeIndex - 4;
@@ -209,30 +332,52 @@ async function runRoute(bot) {
     const flagX = -homeSign * (flagIndex < 4 ? 18 : 10);
     const goalX = homeSign * (routeIndex < 4 ? 4 : 7);
     let captured = false;
-    let recoveringDroppedFlag = false;
-    while (!stopping && !captured) {
-      await waitForRelease(bot);
-      await leavePrison(bot);
-      const flag = recoveringDroppedFlag
-        ? await waitForEnemyFlag(bot, flagX, z, homeSign)
-        : { x: flagX + homeSign * FLAG_APPROACH_OFFSET, z: z + 0.3 };
-      log(bot.username, `go flag ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
-      await goNear(bot, homeSign * 2, bot.entity.position.z);
-      await goNear(bot, homeSign * 2, flag.z);
-      await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying);
-      await waitFor(bot, () => bot.ctf.carrying, `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
-      if (stopping) break;
-      log(bot.username, `go goal ${goalX},${z}`);
-      const previousCaptures = bot.ctf.captures;
-      await goNear(bot, goalX + 0.3, z + 0.3, () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying);
-      captured = bot.ctf.captures > previousCaptures;
-      recoveringDroppedFlag = !captured;
-      if (recoveringDroppedFlag && !stopping) log(bot.username, 'flag lost after capture; retrying after release');
+    let attempts = 0;
+    while (!stopping && !captured && attempts < 4) {
+      attempts++;
+      let flag = null;
+      try {
+        await waitForRelease(bot);
+        await leavePrison(bot);
+        // Always locate the live banner. A teammate may have moved or dropped
+        // it, so a hard-coded origin can leave this bot waiting beside empty air.
+        flag = await waitForEnemyFlag(bot, flagX, z, homeSign);
+        log(bot.username, `go flag ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
+        await goNear(bot, homeSign * 2, bot.entity.position.z);
+        await goNear(bot, homeSign * 2, flag.z);
+        await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying);
+        await waitFor(bot, () => bot.ctf.carrying, `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
+        if (stopping) break;
+        log(bot.username, `go goal ${goalX},${z}`);
+        const previousCaptures = bot.ctf.captures;
+        await goNear(bot, goalX + 0.3, z + 0.3, () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying);
+        captured = bot.ctf.captures > previousCaptures;
+        if (!captured && !stopping) log(bot.username, 'flag lost after capture; retrying after release');
+      } catch (err) {
+        if (stopping) break;
+        bot.clearControlStates();
+        // If the bot was interrupted after pickup, get it back toward its own
+        // half before trying the live flag scan again.
+        if (bot.ctf.carrying) {
+          try {
+            await goNear(bot, goalX + 0.3, z + 0.3, () => !bot.ctf.carrying, { maxDuration: 10000 });
+          } catch (_) { bot.clearControlStates(); }
+        }
+        log(bot.username, `route step ${attempts}/4 skipped; retrying live flag: ${err.message}`);
+        await sleep(250);
+      }
     }
+    if (!captured && !stopping) log(bot.username, `route target ${routeIndex} skipped after ${attempts} attempts`);
   }
   // Keep the demo players visibly active after their assigned flags are gone.
   // Without this, a bot naturally stops at its last target and looks frozen.
   await patrolAfterRoute(bot);
+}
+
+async function runSmartRoute(bot) {
+  log(bot.username, `walk-smart role=${bot.ctf.role}`);
+  if (bot.ctf.role === 'defender') return runDefenderRoute(bot);
+  return runAttackerRoute(bot);
 }
 
 function stopAll() {

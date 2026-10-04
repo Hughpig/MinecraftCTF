@@ -3,6 +3,6 @@
   "version": "0.1.0",
   "private": true,
   "description": "Local authoritative 2D MinecraftCTF spectator viewer",
-  "scripts": { "start": "node server.js" },
+  "scripts": { "start": "node server.js", "test": "node --test" },
   "engines": { "node": ">=18" }
 }

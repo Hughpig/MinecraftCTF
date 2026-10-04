@@ -47,6 +47,9 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public final class CtfPlugin extends JavaPlugin implements Listener {
@@ -66,6 +69,7 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     private String requestedMapMode = "fixed";
     private boolean readyPrompted = false;
     private Path eventLog;
+    private ExecutorService eventLogWriter;
     private ViewerStateWriter viewerWriter;
     private BukkitTask viewerTask;
     private Map<String, Object> viewerResult;
@@ -78,6 +82,11 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         saveDefaultConfig();
         eventLog = getDataFolder().toPath().resolve("events.jsonl");
         getDataFolder().mkdirs();
+        eventLogWriter = Executors.newSingleThreadExecutor(r -> {
+            Thread thread = new Thread(r, "minecraftctf-event-log");
+            thread.setDaemon(true);
+            return thread;
+        });
         getServer().getPluginManager().registerEvents(this, this);
         Objects.requireNonNull(getCommand("ctf")).setExecutor(new CtfCommand(this));
         Objects.requireNonNull(getCommand("ctf")).setTabCompleter(new CtfCommand(this));
@@ -97,6 +106,11 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         if (tickTask != null) tickTask.cancel();
         if (viewerTask != null) viewerTask.cancel();
         if (match != null) finish("server_shutdown");
+        if (eventLogWriter != null) {
+            eventLogWriter.shutdown();
+            try { eventLogWriter.awaitTermination(2, TimeUnit.SECONDS); }
+            catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); }
+        }
         if (viewerWriter != null) { publishViewerState(false); viewerWriter.close(); }
     }
 
@@ -368,7 +382,19 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         viewerEvents.addLast(Map.of("ts", Instant.now().toString(), "event", type, "data", new LinkedHashMap<>(data)));
         while (viewerEvents.size() > 30) viewerEvents.removeFirst();
         String payload = data.entrySet().stream().map(e -> "\"" + e.getKey() + "\":\"" + String.valueOf(e.getValue()).replace("\"", "'") + "\"").collect(Collectors.joining(","));
-        try { Files.writeString(eventLog, "{\"ts\":\"" + Instant.now() + "\",\"event\":\"" + type + "\"," + payload + "}\n", StandardCharsets.UTF_8, Files.exists(eventLog) ? java.nio.file.StandardOpenOption.APPEND : java.nio.file.StandardOpenOption.CREATE); } catch (IOException e) { getLogger().warning("event log failed: " + e.getMessage()); }
+        String line = "{\"ts\":\"" + Instant.now() + "\",\"event\":\"" + type + "\"," + payload + "}\n";
+        if (eventLogWriter != null) eventLogWriter.execute(() -> appendEventLog(line));
+    }
+
+    private void appendEventLog(String line) {
+        try {
+            Files.writeString(eventLog, line, StandardCharsets.UTF_8,
+                    java.nio.file.StandardOpenOption.CREATE,
+                    java.nio.file.StandardOpenOption.WRITE,
+                    java.nio.file.StandardOpenOption.APPEND);
+        } catch (IOException e) {
+            getLogger().warning("event log failed: " + e.getMessage());
+        }
     }
 
     private void publishViewerState(boolean online) {

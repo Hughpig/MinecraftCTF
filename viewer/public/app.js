@@ -36,6 +36,7 @@ let animationStarted = false;
 let lastDrawAt = 0;
 let visualPlayers = new Map();
 const labelCache = new Map();
+let detailsRenderScheduled = false;
 
 function animationNow() {
   return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
@@ -83,7 +84,7 @@ function describeEvent(entry) {
 
 function renderRoster(snapshot) {
   const players = snapshot?.players || [];
-  const rosterKey = JSON.stringify([snapshot?.phase, players.map(player => [player.id, player.name, player.team, player.carrying, player.jailedSeconds, player.ready])]);
+  const rosterKey = `${snapshot?.phase || ''}|${players.map(player => `${player.id}:${player.name}:${player.team}:${player.carrying}:${player.jailedSeconds}:${player.ready}`).join('|')}`;
   if (rosterKey === lastRoster) return;
   lastRoster = rosterKey;
   elements['player-count'].textContent = players.length;
@@ -105,7 +106,8 @@ function renderRoster(snapshot) {
 
 function renderEvents(snapshot) {
   const events = (snapshot?.events || []).slice(-12).reverse();
-  const eventKey = JSON.stringify(events);
+  const newest = events[0];
+  const eventKey = `${events.length}|${newest?.ts || ''}|${newest?.event || ''}|${newest?.data?.player || ''}|${newest?.data?.victim || ''}|${newest?.data?.score || ''}`;
   if (eventKey === lastEvents) return;
   lastEvents = eventKey;
   if (!events.length) {
@@ -119,6 +121,20 @@ function renderEvents(snapshot) {
     row.append(node('span', `event-marker ${entry.event}`), content);
     return row;
   }));
+}
+
+function scheduleDetailsRender() {
+  if (detailsRenderScheduled) return;
+  detailsRenderScheduled = true;
+  const render = () => {
+    detailsRenderScheduled = false;
+    const snapshot = envelope.snapshot;
+    renderRoster(snapshot);
+    renderEvents(snapshot);
+  };
+  // Keep event and roster DOM work away from the snapshot receive stack. This
+  // leaves the next canvas frame free when a flag capture or release arrives.
+  setTimeout(render, 75);
 }
 
 function renderHud() {
@@ -150,8 +166,7 @@ function renderHud() {
   elements['start-demo'].disabled = !online || !token || demoRunning || snapshot?.phase === 'running';
   setText(elements['start-demo'], demoRunning ? '演示局运行中…' : snapshot?.phase === 'running' ? '比赛正在进行' : '▶ 开始演示局');
   setText(elements['demo-status'], demoError || (!online ? '先启动 Paper，网页会自动连接。' : demoRunning ? '正在运行真实本地机器人比赛。' : envelope.demo.status === 'succeeded' ? '上一局验证通过，可再次演示。' : envelope.demo.status === 'failed' ? envelope.demo.message : '演示会生成地图；只连接本机服务器。'));
-  renderRoster(snapshot);
-  renderEvents(snapshot);
+  scheduleDetailsRender();
 }
 
 function receive(state) {

@@ -45,7 +45,7 @@ function createViewer(sourcePath = path.join(__dirname, '../public/app.js')) {
     },
     window: { devicePixelRatio: 2 },
     EventSource: class {}, ResizeObserver: class { observe() {} },
-    requestAnimationFrame() {}, setInterval() {}
+    requestAnimationFrame() {}, setInterval() {}, setTimeout(callback) { callback(); return 0; }
   });
   vm.runInContext(fs.readFileSync(sourcePath, 'utf8'), sandbox);
   vm.runInContext('gatewayConnected = true', sandbox);

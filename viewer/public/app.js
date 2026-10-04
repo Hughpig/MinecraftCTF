@@ -175,14 +175,17 @@ function receive(state) {
     const nextStaticLayerKey = JSON.stringify([
       state.snapshot?.mapBuilt,
       state.snapshot?.mapVersion,
-      state.snapshot?.bounds,
-      state.snapshot?.prisons
+      state.snapshot?.bounds
     ]);
     if (nextStaticLayerKey !== staticLayerKey) {
       staticLayerKey = nextStaticLayerKey;
       staticLayerDirty = true;
     }
-    const nextObjectiveLayerKey = JSON.stringify([state.snapshot?.targets, state.snapshot?.flags]);
+    const nextObjectiveLayerKey = JSON.stringify([
+      state.snapshot?.targets,
+      state.snapshot?.flags,
+      (state.snapshot?.prisons || []).map(prison => [prison.team, prison.open])
+    ]);
     if (nextObjectiveLayerKey !== objectiveLayerKey) {
       objectiveLayerKey = nextObjectiveLayerKey;
       objectiveLayerDirty = true;
@@ -317,9 +320,7 @@ function renderStaticLayer(snapshot) {
     staticLayerDirty = false;
     return;
   }
-  const openDoors = new Set((snapshot.prisons || []).filter(prison => prison.open).map(prison => `${prison.doorX},${prison.doorZ}`));
   for (const block of snapshot.blocks) {
-    if (block.kind === 'door' && openDoors.has(`${block.x},${block.z}`)) continue;
     cell(staticContext, block.x, block.z, block.kind === 'divider' ? '#eeeef0' : block.kind === 'door' ? '#a8b3bf' : '#34383f', block.kind === 'divider' ? '#dfdfe2' : '#72747a');
   }
   for (const prison of snapshot.prisons || []) {
@@ -356,6 +357,12 @@ function interpolationFrames() {
 
 function renderObjectiveLayer(snapshot) {
   objectiveContext.clearRect(0, 0, width, height);
+  for (const prison of snapshot?.prisons || []) {
+    if (!prison.open) continue;
+    // Erase only an opened door from the cached map layer. The rest of the
+    // static map stays untouched when a player is released.
+    cell(objectiveContext, prison.doorX, prison.doorZ, '#fcfdff', '#edf0f3');
+  }
   if (snapshot?.mapBuilt) renderObjectives(objectiveContext, snapshot);
   objectiveLayerDirty = false;
 }
@@ -460,6 +467,7 @@ function draw() {
 function setPerspective(team) {
   perspective = team;
   staticLayerDirty = true;
+  objectiveLayerDirty = true;
   elements['perspective-badge'].className = `perspective-badge ${team === 'left' ? 'red' : 'blue'}`;
   elements['perspective-title'].textContent = team === 'left' ? '红队视角 (RED)' : '蓝队视角 (BLUE)';
   for (const [id, active] of [['red-view', team === 'left'], ['blue-view', team === 'right']]) {

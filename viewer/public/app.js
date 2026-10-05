@@ -7,6 +7,17 @@ const objectiveContext = objectiveCanvas.getContext('2d');
 let interpolationDelay = 300;
 let recentSnapshotGap = 200;
 const debugPerformance = typeof location !== 'undefined' && new URLSearchParams(location.search).has('debug');
+// ?fps=<10-240> caps the canvas draw loop; without it the loop runs on every
+// animation frame the display allows (vertical sync), which is already the
+// maximum a browser can present.
+const fpsCap = (() => {
+  if (typeof location === 'undefined') return 0;
+  const raw = new URLSearchParams(location.search).get('fps');
+  if (raw === null || raw === '') return 0;
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return Math.min(240, Math.max(10, value));
+})();
 let cachedBlocks = [];
 let cachedBlocksKey = '';
 const startupBlendDuration = 300;
@@ -463,10 +474,13 @@ function interpolationFrames() {
 function renderObjectiveLayer(snapshot) {
   objectiveContext.clearRect(0, 0, width, height);
   for (const prison of snapshot?.prisons || []) {
-    if (!prison.open) continue;
-    // Erase only an opened door from the cached map layer. The rest of the
-    // static map stays untouched when a player is released.
-    cell(objectiveContext, prison.doorX, prison.doorZ, '#fcfdff', '#edf0f3');
+    // The snapshot door position is a precise location, not a block index;
+    // floor it so the cell aligns with the cached map layer. A jail in
+    // progress seals the doorway into the wall; an open prison shows floor.
+    const doorX = Math.floor(prison.doorX);
+    const doorZ = Math.floor(prison.doorZ);
+    if (prison.open) cell(objectiveContext, doorX, doorZ, '#fcfdff', '#edf0f3');
+    else cell(objectiveContext, doorX, doorZ, '#34383f', '#72747a');
   }
   if (snapshot?.mapBuilt) renderObjectives(objectiveContext, snapshot);
   objectiveLayerDirty = false;
@@ -528,6 +542,10 @@ function renderObjectives(drawingContext, snapshot) {
 }
 
 function draw() {
+  if (fpsCap > 0 && lastDrawAt && animationNow() - lastDrawAt < 1000 / fpsCap - 1) {
+    requestAnimationFrame(draw);
+    return;
+  }
   const snapshot = envelope.snapshot;
   const bounds = snapshot?.bounds || { minX: -24, maxX: 24, minZ: -36, maxZ: 36 };
   if (staticLayerDirty) {

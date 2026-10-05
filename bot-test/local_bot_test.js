@@ -1,11 +1,18 @@
 const mineflayer = require('mineflayer');
 const { Vec3 } = require('vec3');
+const loopDiagnostics = require('./loop-diagnostics')();
+const findArenaFlags = require('./arena-flag-search');
+const waitForInitialWorld = require('./startup-world');
 
 const HOST = process.env.CTF_HOST || '127.0.0.1';
 const PORT = Number(process.env.CTF_PORT || 25565);
 const BOT_COUNT = Math.max(1, Math.min(16, Number(process.env.CTF_BOTS || 2)));
 const PLAYERS_PER_TEAM = Math.max(1, Math.min(16, Number(process.env.CTF_PLAYERS || 1)));
 const ACTIVE_TEAM = process.env.CTF_ACTIVE_TEAM || 'both';
+const VIEW_DISTANCE = Number(process.env.CTF_BOT_VIEW_DISTANCE ?? 3);
+const JOIN_DELAY_MS = Number(process.env.CTF_BOT_JOIN_DELAY_MS ?? 400);
+if (!Number.isInteger(VIEW_DISTANCE) || VIEW_DISTANCE < 2 || VIEW_DISTANCE > 32) throw new Error('CTF_BOT_VIEW_DISTANCE must be an integer between 2 and 32');
+if (!Number.isFinite(JOIN_DELAY_MS) || JOIN_DELAY_MS < 0 || JOIN_DELAY_MS > 5000) throw new Error('CTF_BOT_JOIN_DELAY_MS must be between 0 and 5000');
 const MATCH = `match team:local-bots enemy:bot players:${PLAYERS_PER_TEAM} map:fixed`;
 const FLAG_APPROACH_OFFSET = 1.25;
 const bots = [];
@@ -20,22 +27,18 @@ const log = (name, message) => console.log(`[${new Date().toISOString()}] [${nam
 
 function makeBot(index) {
   const username = `LocalCTF_${index + 1}`;
-  const bot = mineflayer.createBot({ host: HOST, port: PORT, username, auth: 'offline', version: '1.21.8' });
+  const bot = mineflayer.createBot({ host: HOST, port: PORT, username, auth: 'offline', version: '1.21.8', viewDistance: VIEW_DISTANCE });
   bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, pickups: 0, captures: 0 };
 
-  bot.once('spawn', async () => {
+  bot.once('spawn', () => {
     log(username, `connected to ${HOST}:${PORT}`);
-    if (index === 0) {
-      bot.chat('/ctf setup');
-    }
-    await mapReady;
-    if (stopping) return;
-    bot.chat(MATCH);
   });
 
   bot.on('messagestr', message => {
     log(username, message);
-    if (message.includes('固定地图已生成：')) confirmMapReady();
+    if (message.includes('固定地图已生成：') || message.includes('固定地图已就绪：')) {
+      confirmMapReady();
+    }
     if (message.includes('Are you ready?')) bot.chat("I'm ready!");
     if (message.startsWith('Game start: ')) {
       try {
@@ -46,6 +49,10 @@ function makeBot(index) {
           bot.ctf.teamSize = teams[bot.ctf.team].length;
         }
         if (bot.ctf.team && !bot.ctf.started) {
+          if (!bots.some(other => other.ctf.started)) {
+            clearTimeout(testTimeout);
+            testTimeout = setTimeout(() => { log('smoke', 'test deadline exceeded'); stopAll(); }, 210000);
+          }
           bot.ctf.started = true;
           if (ACTIVE_TEAM === 'both' || ACTIVE_TEAM === bot.ctf.team) {
             runRoute(bot).catch(err => {
@@ -76,6 +83,7 @@ function makeBot(index) {
   bot.on('kicked', reason => log(username, `kicked: ${JSON.stringify(reason)}`));
   bot.on('end', reason => log(username, `disconnected: ${reason || 'unknown'}`));
   bots.push(bot);
+  return bot;
 }
 
 async function goNear(bot, x, z, completed = () => false) {
@@ -140,8 +148,7 @@ function findEnemyFlag(bot, preferredX, preferredZ, homeSign) {
   const blockName = bot.ctf.team === 'left' ? 'blue_banner' : 'red_banner';
   const block = bot.registry.blocksByName[blockName];
   if (!block || !bot.entity) return null;
-  const positions = bot.findBlocks({ matching: block.id, maxDistance: 96, count: 32 })
-    .filter(position => (bot.ctf.team === 'left' ? position.x > 1 : position.x < -1));
+  const positions = findArenaFlags(bot, block.id);
   if (positions.length === 0) return null;
   positions.sort((a, b) => {
     const aPreferred = Math.hypot(a.x - preferredX, a.z - preferredZ);
@@ -238,6 +245,7 @@ async function runRoute(bot) {
 function stopAll() {
   if (stopping) return;
   stopping = true;
+  loopDiagnostics.stop();
   clearTimeout(testTimeout);
   clearTimeout(finishTimer);
   const pickups = bots.reduce((total, bot) => total + bot.ctf.pickups, 0);
@@ -251,6 +259,25 @@ function stopAll() {
   }
 }
 
-const testTimeout = setTimeout(() => { log('smoke', 'test deadline exceeded'); stopAll(); }, 210000);
-for (let i = 0; i < BOT_COUNT; i++) makeBot(i);
+let testTimeout = setTimeout(() => { log('smoke', 'startup deadline exceeded'); stopAll(); }, 120000);
+async function startBots() {
+  for (let i = 0; i < BOT_COUNT && !stopping; i++) {
+    const bot = makeBot(i);
+    await waitForInitialWorld(bot, { isStopping: () => stopping });
+    if (stopping) return;
+    log(bot.username, 'startup terrain loaded');
+    if (i === 0) {
+      bot.chat('/ctf setup');
+      await mapReady;
+    }
+    if (i + 1 < BOT_COUNT) await sleep(JOIN_DELAY_MS);
+  }
+  await sleep(2000);
+  for (const bot of bots) {
+    if (stopping) return;
+    bot.chat(MATCH);
+    await sleep(100);
+  }
+}
+startBots().catch(error => { log('smoke', error.stack || error); stopAll(); });
 process.on('SIGINT', stopAll);

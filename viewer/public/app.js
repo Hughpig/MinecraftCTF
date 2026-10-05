@@ -4,8 +4,13 @@ const staticCanvas = document.createElement('canvas');
 const staticContext = staticCanvas.getContext('2d');
 const objectiveCanvas = document.createElement('canvas');
 const objectiveContext = objectiveCanvas.getContext('2d');
-const interpolationDelay = 300;
-const startupBlendDuration = 1000;
+let interpolationDelay = 300;
+let recentSnapshotGap = 200;
+const debugPerformance = typeof location !== 'undefined' && new URLSearchParams(location.search).has('debug');
+let cachedBlocks = [];
+let cachedBlocksKey = '';
+const startupBlendDuration = 300;
+const teleportDistance = 3;
 const elements = Object.fromEntries([
   'connection-dot', 'connection-text', 'left-score', 'right-score', 'left-progress', 'right-progress',
   'phase', 'timer', 'result-text', 'perspective-badge', 'perspective-title', 'red-view', 'blue-view',
@@ -18,6 +23,8 @@ let envelope = { connected: false, snapshot: null, demo: { status: 'idle' } };
 let perspective = 'left';
 let gatewayConnected = false;
 let playerFrames = [];
+let clockOffset = null;
+let lastReceivedAt = 0;
 let token = '';
 let demoPending = false;
 let demoError = '';
@@ -37,9 +44,20 @@ let lastDrawAt = 0;
 let visualPlayers = new Map();
 const labelCache = new Map();
 let detailsRenderScheduled = false;
+let eventKeys = [];
 
 function animationNow() {
   return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
+}
+
+function serverClock(serverTime, receivedAt) {
+  const sample = receivedAt - serverTime;
+  // Late delivery raises the measured offset. Follow a lower latency sample
+  // immediately and correct upward slowly to preserve the server's cadence.
+  clockOffset = clockOffset === null || sample < clockOffset
+    ? sample
+    : clockOffset + (sample - clockOffset) * 0.002;
+  return serverTime + clockOffset;
 }
 
 function setText(element, text) {
@@ -106,21 +124,35 @@ function renderRoster(snapshot) {
 
 function renderEvents(snapshot) {
   const events = (snapshot?.events || []).slice(-12).reverse();
-  const newest = events[0];
-  const eventKey = `${events.length}|${newest?.ts || ''}|${newest?.event || ''}|${newest?.data?.player || ''}|${newest?.data?.victim || ''}|${newest?.data?.score || ''}`;
+  const keys = events.map(event => `${event.ts || ''}|${event.event || ''}|${JSON.stringify(event.data || {})}`);
+  const eventKey = keys.join('\n');
   if (eventKey === lastEvents) return;
-  lastEvents = eventKey;
-  if (!events.length) {
-    elements['event-list'].replaceChildren(node('p', 'empty-message', '等待开局事件'));
+  const list = elements['event-list'];
+  const canIncrement = typeof list.insertBefore === 'function' && eventKeys.length > 0
+    && keys.length >= eventKeys.length - 1
+    && keys.slice(1, eventKeys.length).every((key, index) => key === eventKeys[index]);
+  if (canIncrement && keys[0] && keys[0] !== eventKeys[0]) {
+    list.insertBefore(createEventRow(events[0]), list.firstChild || null);
+    while (list.children.length > 12) list.removeChild(list.lastChild);
+    eventKeys = keys;
+    lastEvents = eventKey;
     return;
   }
-  elements['event-list'].replaceChildren(...events.map(entry => {
-    const row = node('div', 'event-row');
-    const content = node('div');
-    content.append(node('div', 'event-message', describeEvent(entry)), node('div', 'event-time', new Date(entry.ts).toLocaleTimeString('zh-CN', { hour12: false })));
-    row.append(node('span', `event-marker ${entry.event}`), content);
-    return row;
-  }));
+  lastEvents = eventKey;
+  eventKeys = keys;
+  if (!events.length) {
+    list.replaceChildren(node('p', 'empty-message', '等待开局事件'));
+    return;
+  }
+  list.replaceChildren(...events.map(createEventRow));
+}
+
+function createEventRow(entry) {
+  const row = node('div', 'event-row');
+  const content = node('div');
+  content.append(node('div', 'event-message', describeEvent(entry)), node('div', 'event-time', new Date(entry.ts).toLocaleTimeString('zh-CN', { hour12: false })));
+  row.append(node('span', `event-marker ${entry.event}`), content);
+  return row;
 }
 
 function scheduleDetailsRender() {
@@ -135,6 +167,13 @@ function scheduleDetailsRender() {
   // Keep event and roster DOM work away from the snapshot receive stack. This
   // leaves the next canvas frame free when a flag capture or release arrives.
   setTimeout(render, 75);
+}
+
+function objectiveKey(snapshot) {
+  const targets = (snapshot?.targets || []).map(target => `${target.id}:${target.locked ? 1 : 0}:${target.flagTeam || ''}`);
+  const flags = (snapshot?.flags || []).map(flag => `${flag.id}:${flag.status}:${flag.x}:${flag.z}`);
+  const prisons = (snapshot?.prisons || []).map(prison => `${prison.team}:${prison.open ? 1 : 0}`);
+  return `${targets.join('|')}||${flags.join('|')}||${prisons.join('|')}`;
 }
 
 function renderHud() {
@@ -170,37 +209,60 @@ function renderHud() {
 }
 
 function receive(state) {
+  if (state.snapshot) {
+    const key = `${state.snapshot.mapVersion ?? 0}:${state.snapshot.mapBuilt === true}`;
+    if (Array.isArray(state.snapshot.blocks)) {
+      if (key !== cachedBlocksKey || (cachedBlocks.length === 0 && state.snapshot.blocks.length > 0)) staticLayerDirty = true;
+      cachedBlocks = state.snapshot.blocks;
+      cachedBlocksKey = key;
+    } else {
+      state.snapshot.blocks = key === cachedBlocksKey ? cachedBlocks : [];
+    }
+  }
   if (state.snapshot && state.snapshot.updatedAt !== envelope.snapshot?.updatedAt) {
     const serverTime = state.snapshot.updatedAt;
     const phaseChanged = state.snapshot.phase !== envelope.snapshot?.phase;
     const receivedAt = animationNow();
+    const lastFrame = playerFrames.at(-1);
+    if (debugPerformance && lastFrame && !phaseChanged && state.snapshot.phase === 'running') {
+      const gapRecv = Math.round(receivedAt - lastReceivedAt);
+      const gapServer = Math.round(serverTime - lastFrame.serverAt);
+      if (gapRecv > 100 || gapServer > 100) console.warn(performance.now() | 0, 'slow snapshot recv', gapRecv, 'server', gapServer, 'snapshotAt', serverTime, 'receivedAt', Date.now());
+    }
     if (phaseChanged || (playerFrames.length && (serverTime < playerFrames.at(-1).serverAt || serverTime - playerFrames.at(-1).serverAt > 1000))) {
       playerFrames = [];
+      clockOffset = null;
+      lastReceivedAt = 0;
       visualPlayers = new Map();
       phaseChangedAt = receivedAt;
     }
     if (!playerFrames.length || serverTime > playerFrames.at(-1).serverAt) {
-      // Use browser receive time for animation. Server timestamps describe the
-      // snapshot age, but queued SSE/file updates can arrive in one burst; using
-      // server time there makes the viewer replay the burst at high speed.
-      playerFrames.push({ at: receivedAt, serverAt: serverTime, players: new Map((state.snapshot?.players || []).map(player => [player.id, player])) });
+      const previousFrame = playerFrames.at(-1);
+      if (previousFrame) {
+        const gap = Math.max(0, receivedAt - lastReceivedAt);
+        // Keep enough history to cover a delayed file update, but let the
+        // buffer shrink slowly again after the server settles. A short buffer
+        // makes normal movement responsive; a long one absorbs event bursts.
+        recentSnapshotGap = Math.max(gap, recentSnapshotGap * 0.98);
+        interpolationDelay = Math.min(700, Math.max(250, recentSnapshotGap * 1.5));
+      }
+      const frameAt = serverClock(serverTime, receivedAt);
+      lastReceivedAt = receivedAt;
+      playerFrames.push({
+        at: previousFrame ? Math.max(frameAt, previousFrame.at + 1) : frameAt,
+        serverAt: serverTime,
+        players: new Map((state.snapshot?.players || []).map(player => [player.id, player]))
+      });
       playerFrames = playerFrames.filter(frame => receivedAt - frame.at < 2000).slice(-16);
     }
 
-    const nextStaticLayerKey = JSON.stringify([
-      state.snapshot?.mapBuilt,
-      state.snapshot?.mapVersion,
-      state.snapshot?.bounds
-    ]);
+    const bounds = state.snapshot?.bounds || {};
+    const nextStaticLayerKey = `${state.snapshot?.mapBuilt ? 1 : 0}|${state.snapshot?.mapVersion || 0}|${bounds.minX}|${bounds.maxX}|${bounds.minZ}|${bounds.maxZ}`;
     if (nextStaticLayerKey !== staticLayerKey) {
       staticLayerKey = nextStaticLayerKey;
       staticLayerDirty = true;
     }
-    const nextObjectiveLayerKey = JSON.stringify([
-      state.snapshot?.targets,
-      state.snapshot?.flags,
-      (state.snapshot?.prisons || []).map(prison => [prison.team, prison.open])
-    ]);
+    const nextObjectiveLayerKey = objectiveKey(state.snapshot);
     if (nextObjectiveLayerKey !== objectiveLayerKey) {
       objectiveLayerKey = nextObjectiveLayerKey;
       objectiveLayerDirty = true;
@@ -208,12 +270,16 @@ function receive(state) {
   }
   if (!state.snapshot) {
     playerFrames = [];
+    clockOffset = null;
+    lastReceivedAt = 0;
     visualPlayers = new Map();
     lastDrawAt = 0;
     staticLayerDirty = true;
     staticLayerKey = '';
     objectiveLayerDirty = true;
     objectiveLayerKey = '';
+    eventKeys = [];
+    lastEvents = '';
   }
   envelope = state;
   renderHud();
@@ -358,7 +424,31 @@ function interpolationFrames() {
   let previousFrame = playerFrames[0];
   let nextFrame = latestFrame;
   if (target <= previousFrame.at) return { previousFrame, nextFrame: previousFrame, blend: 0, latestFrame, startupBlend };
-  if (target >= nextFrame.at) return { previousFrame: nextFrame, nextFrame, blend: 0, latestFrame, startupBlend };
+  if (target >= nextFrame.at) {
+    // The receive stream can briefly go quiet while the player is still
+    // moving. Extrapolate only a short, bounded interval from the last two
+    // frames; after that, hold the latest authoritative position.
+    const gap = Math.min(180, target - nextFrame.at);
+    if (gap > 0 && playerFrames.length >= 2) {
+      const previous = playerFrames.at(-2);
+      const elapsed = nextFrame.at - previous.at;
+      if (elapsed > 0) {
+        const extrapolation = Math.min(1.5, gap / elapsed);
+        const players = new Map();
+        for (const [id, player] of nextFrame.players) {
+          const old = previous.players.get(id);
+          if (!old || Math.hypot(player.x - old.x, player.z - old.z) >= teleportDistance) {
+            players.set(id, player);
+            continue;
+          }
+          players.set(id, { ...player, x: player.x + (player.x - old.x) * extrapolation, z: player.z + (player.z - old.z) * extrapolation });
+        }
+        const projectedFrame = { ...nextFrame, players };
+        return { previousFrame: projectedFrame, nextFrame: projectedFrame, blend: 0, latestFrame, startupBlend };
+      }
+    }
+    return { previousFrame: nextFrame, nextFrame, blend: 0, latestFrame, startupBlend };
+  }
   for (let index = 1; index < playerFrames.length; index++) {
     if (playerFrames[index].at >= target) {
       previousFrame = playerFrames[index - 1];
@@ -388,11 +478,11 @@ function interpolatedPosition(player, frames) {
   const previous = previousFrame.players.get(player.id);
   const next = nextFrame.players.get(player.id);
   if (!previous || !next) return player;
-  if (Math.hypot(previous.x - next.x, previous.z - next.z) >= 5) return blend < 1 ? previous : next;
+  if (Math.hypot(previous.x - next.x, previous.z - next.z) >= teleportDistance) return blend < 1 ? previous : next;
   const historical = { x: previous.x + (next.x - previous.x) * blend, z: previous.z + (next.z - previous.z) * blend };
   const latest = frames.latestFrame?.players.get(player.id);
   if (!latest || frames.startupBlend >= 1) return historical;
-  if (Math.hypot(historical.x - latest.x, historical.z - latest.z) >= 5) return latest;
+  if (Math.hypot(historical.x - latest.x, historical.z - latest.z) >= teleportDistance) return latest;
   return {
     x: latest.x + (historical.x - latest.x) * frames.startupBlend,
     z: latest.z + (historical.z - latest.z) * frames.startupBlend
@@ -400,24 +490,20 @@ function interpolatedPosition(player, frames) {
 }
 
 function smoothPlayerPosition(player, target, deltaSeconds) {
-  const status = `${player.jailedSeconds > 0 ? 'jailed' : 'free'}:${player.carrying ? 'carrying' : 'empty'}`;
   let visual = visualPlayers.get(player.id);
-  if (!visual || visual.status !== status || Math.hypot(visual.x - target.x, visual.z - target.z) >= 5) {
-    visual = { x: target.x, z: target.z, status };
+  // Gameplay status changes do not move the player. Reset only when the
+  // position itself jumps, including the teleport into prison after capture.
+  if (!visual || Math.hypot(visual.x - target.x, visual.z - target.z) >= teleportDistance) {
+    visual = { x: target.x, z: target.z };
     visualPlayers.set(player.id, visual);
     return visual;
   }
-  // Keep visual movement bounded. If rendering or delivery pauses briefly, the
-  // next frame follows the new target at a normal walk-like rate instead of
-  // fast-forwarding through all accumulated snapshots.
-  const distance = Math.hypot(target.x - visual.x, target.z - visual.z);
-  const maxStep = 8 * Math.min(0.05, Math.max(0, deltaSeconds));
-  if (distance <= maxStep || maxStep === 0) {
-    if (maxStep > 0) { visual.x = target.x; visual.z = target.z; }
-    return visual;
-  }
-  visual.x += (target.x - visual.x) / distance * maxStep;
-  visual.z += (target.z - visual.z) / distance * maxStep;
+  // Interpolation already removes snapshot stepping. This second pass only
+  // absorbs a delayed frame, so use exponential convergence instead of a
+  // walk-speed cap that can permanently fall behind the target.
+  const k = 1 - Math.exp(-Math.min(0.25, Math.max(0, deltaSeconds)) * 20);
+  visual.x += (target.x - visual.x) * k;
+  visual.z += (target.z - visual.z) * k;
   return visual;
 }
 
@@ -457,6 +543,9 @@ function draw() {
   const animationTime = animationNow();
   const deltaSeconds = lastDrawAt ? (animationTime - lastDrawAt) / 1000 : 0;
   lastDrawAt = animationTime;
+  if (debugPerformance && snapshot.phase === 'running' && deltaSeconds > 0.025) {
+    console.warn('slow frame', Math.round(deltaSeconds * 1000), 'ms');
+  }
   const frames = interpolationFrames();
   for (const player of snapshot.players) {
     const target = interpolatedPosition(player, frames);

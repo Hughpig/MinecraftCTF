@@ -1,4 +1,5 @@
 const http = require('node:http');
+const fsNative = require('node:fs');
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
@@ -8,6 +9,8 @@ const port = Number(process.env.CTF_VIEWER_PORT || 3000);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('CTF_VIEWER_PORT must be between 1024 and 65535');
 const root = path.resolve(__dirname, '..');
 const snapshotPath = path.join(root, 'server', 'plugins', 'MinecraftCTF', 'viewer-state.json');
+const snapshotDirectory = path.dirname(snapshotPath);
+const snapshotFilename = path.basename(snapshotPath);
 const assets = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
@@ -17,11 +20,15 @@ const allowedHosts = new Set([`127.0.0.1:${port}`, `localhost:${port}`]);
 const token = crypto.randomBytes(24).toString('hex');
 const clients = new Set();
 let snapshot = null;
+let cachedBlocks = null;
+let cachedBlocksKey = null;
 let demo = { status: 'idle', message: '' };
 let demoProcess = null;
 let previousState = null;
 let previousSnapshot = '';
 let reading = false;
+let refreshQueued = false;
+let refreshAgain = false;
 
 function currentState() {
   return {
@@ -29,6 +36,15 @@ function currentState() {
     snapshot,
     demo
   };
+}
+
+function blocksKey(state) {
+  return `${state.mapVersion ?? 0}:${state.mapBuilt === true}`;
+}
+
+function withBlocks(state) {
+  if (!state.snapshot || Array.isArray(state.snapshot.blocks) || cachedBlocksKey !== blocksKey(state.snapshot)) return state;
+  return { ...state, snapshot: { ...state.snapshot, blocks: cachedBlocks } };
 }
 
 function broadcast() {
@@ -40,13 +56,20 @@ function broadcast() {
 }
 
 async function refresh() {
-  if (reading) return;
+  if (reading) {
+    refreshAgain = true;
+    return;
+  }
   reading = true;
   try {
     const content = await fs.readFile(snapshotPath, 'utf8');
     if (content !== previousSnapshot) {
       const candidate = JSON.parse(content);
       if (candidate.schemaVersion === 1 && Number.isFinite(candidate.updatedAt)) {
+        if (Array.isArray(candidate.blocks)) {
+          cachedBlocks = candidate.blocks;
+          cachedBlocksKey = blocksKey(candidate);
+        }
         snapshot = candidate;
         previousSnapshot = content;
       }
@@ -56,7 +79,20 @@ async function refresh() {
   } finally {
     reading = false;
     broadcast();
+    if (refreshAgain) {
+      refreshAgain = false;
+      queueRefresh();
+    }
   }
+}
+
+function queueRefresh() {
+  if (refreshQueued) return;
+  refreshQueued = true;
+  setTimeout(() => {
+    refreshQueued = false;
+    refresh();
+  }, 10);
 }
 
 function json(response, status, data) {
@@ -108,11 +144,11 @@ const server = http.createServer(async (request, response) => {
   }
   if (request.method !== 'GET') return json(response, 405, { error: 'Method not allowed' });
   if (pathname === '/api/session') return json(response, 200, { token });
-  if (pathname === '/api/state') return json(response, 200, currentState());
+  if (pathname === '/api/state') return json(response, 200, withBlocks(currentState()));
   if (pathname === '/api/stream') {
     if (clients.size >= 16) return json(response, 503, { error: 'Too many viewer connections' });
     response.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
-    response.write(`data: ${JSON.stringify(currentState())}\n\n`);
+    response.write(`data: ${JSON.stringify(withBlocks(currentState()))}\n\n`);
     clients.add(response);
     request.on('close', () => clients.delete(response));
     return;
@@ -129,9 +165,22 @@ const server = http.createServer(async (request, response) => {
   }
 });
 
-const refreshTimer = setInterval(refresh, 100);
+// ViewerStateWriter replaces the snapshot atomically. Watching the containing
+// directory lets us forward a new state as soon as the rename is visible,
+// while the slower timer remains as a recovery path for missed Windows events.
+let snapshotWatcher = null;
+try {
+  snapshotWatcher = fsNative.watch(snapshotDirectory, { persistent: false }, (_eventType, filename) => {
+    const name = filename ? filename.toString() : '';
+    if (!name || name === snapshotFilename || name === `${snapshotFilename}.tmp`) queueRefresh();
+  });
+  snapshotWatcher.on('error', error => console.error(`Snapshot watcher failed: ${error.message}`));
+} catch (error) {
+  console.error(`Snapshot watcher unavailable: ${error.message}`);
+}
+const refreshTimer = setInterval(refresh, 500);
 const heartbeatTimer = setInterval(() => { for (const client of clients) client.write(': heartbeat\n\n'); }, 10000);
-server.on('error', error => { console.error(error.message); process.exitCode = 1; clearInterval(refreshTimer); clearInterval(heartbeatTimer); });
+server.on('error', error => { console.error(error.message); process.exitCode = 1; clearInterval(refreshTimer); clearInterval(heartbeatTimer); snapshotWatcher?.close(); });
 server.listen(port, '127.0.0.1', () => {
   console.log(`MinecraftCTF viewer: http://127.0.0.1:${port}`);
   console.log(`Authoritative state: ${snapshotPath}`);
@@ -140,6 +189,7 @@ server.listen(port, '127.0.0.1', () => {
 
 function shutdown() {
   clearInterval(refreshTimer); clearInterval(heartbeatTimer);
+  snapshotWatcher?.close();
   if (demoProcess) demoProcess.kill();
   for (const client of clients) client.end();
   server.close();

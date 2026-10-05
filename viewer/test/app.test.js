@@ -4,9 +4,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { test } = require('node:test');
 
-function createViewer(sourcePath = path.join(__dirname, '../public/app.js')) {
+function createViewer(sourcePath = path.join(__dirname, '../public/app.js'), debug = false) {
   let now = 10000;
-  const metrics = { textWrites: 0, fillText: 0, fillRect: 0, canvasResizes: 0 };
+  const metrics = { textWrites: 0, fillText: 0, fillRect: 0, canvasResizes: 0, warnings: [] };
   const elements = new Map();
   function element() {
     let content = '';
@@ -35,7 +35,10 @@ function createViewer(sourcePath = path.join(__dirname, '../public/app.js')) {
     };
   }
   const sandbox = vm.createContext({
-    console, Date: class extends Date { static now() { return now; } },
+    console: { ...console, warn(...args) { metrics.warnings.push(args); } },
+    Date: class extends Date { static now() { return now; } },
+    performance: { now() { return now; } },
+    location: { search: debug ? '?debug=1' : '' }, URLSearchParams,
     document: {
       createElement: element,
       getElementById(id) {
@@ -105,6 +108,38 @@ test('position-only snapshots do not rewrite HUD text or rebuild static content'
   assert.equal(viewer.metrics.fillRect, before.fillRect);
 });
 
+test('static blocks survive sparse snapshots and refresh after a map version change', () => {
+  const viewer = createViewer();
+  const first = snapshot(10000);
+  first.mapVersion = 1;
+  first.blocks = [{ x: 1, z: 2, kind: 'wall' }];
+  viewer.receive(first);
+  viewer.run('draw()');
+
+  const sparse = snapshot(10100);
+  sparse.mapVersion = 1;
+  delete sparse.blocks;
+  viewer.receive(sparse);
+  assert.equal(viewer.run('envelope.snapshot.blocks.length'), 1);
+  assert.equal(viewer.run('staticLayerDirty'), false);
+
+  const changed = snapshot(10200);
+  changed.mapVersion = 2;
+  delete changed.blocks;
+  viewer.receive(changed);
+  assert.equal(viewer.run('envelope.snapshot.blocks.length'), 0);
+  viewer.run('draw()');
+  assert.equal(viewer.run('staticLayerDirty'), false);
+
+  const newBlocks = snapshot(10300);
+  newBlocks.mapVersion = 2;
+  newBlocks.blocks = [{ x: 3, z: 4, kind: 'wall' }];
+  viewer.receive(newBlocks);
+  assert.equal(viewer.run('staticLayerDirty'), true);
+  viewer.run('draw()');
+  assert.equal(viewer.run('envelope.snapshot.blocks[0].x'), 3);
+});
+
 test('flag, target, name and perspective changes invalidate their cached content', () => {
   const viewer = createViewer();
   viewer.receive(snapshot());
@@ -149,7 +184,7 @@ test('interpolation uses snapshot time and steps across teleports without revers
   moved.players[0].x = 1;
   viewer.receive(moved);
   viewer.setTime(10400);
-  assert.ok(Math.abs(viewer.run('interpolatedPosition(envelope.snapshot.players[0], interpolationFrames()).x') - 0.95) < 1e-9);
+  assert.ok(Math.abs(viewer.run('interpolatedPosition(envelope.snapshot.players[0], interpolationFrames()).x') - 5 / 6) < 1e-9);
   const teleported = snapshot(10400);
   teleported.players[0].x = 20;
   viewer.receive(teleported, 10400);
@@ -179,6 +214,102 @@ test('startup blending does not fall back to an older frame', () => {
 
   assert.ok(openingPosition >= 1);
   assert.ok(blendedPosition > openingPosition);
+  viewer.setTime(10600);
+  assert.equal(viewer.run('interpolationFrames().startupBlend'), 1);
+});
+
+test('flag and release status changes preserve movement smoothing', () => {
+  for (const [before, after] of [
+    [{ carrying: '', jailedSeconds: 0 }, { carrying: 'right-flag-1', jailedSeconds: 0 }],
+    [{ carrying: 'right-flag-1', jailedSeconds: 0 }, { carrying: '', jailedSeconds: 0 }],
+    [{ carrying: '', jailedSeconds: 1 }, { carrying: '', jailedSeconds: 0 }]
+  ]) {
+    const viewer = createViewer();
+    viewer.receive(snapshot());
+    viewer.run(`smoothPlayerPosition({ id: '0', ...${JSON.stringify(before)} }, { x: 0, z: 0 }, 0.016)`);
+    const x = viewer.run(`smoothPlayerPosition({ id: '0', ...${JSON.stringify(after)} }, { x: 0.5, z: 0 }, 0.016).x`);
+    assert.ok(x > 0 && x < 0.5, 'status change must not snap to the target');
+  }
+});
+
+test('three-block teleports step in interpolation and skip extrapolation', () => {
+  const viewer = createViewer();
+  viewer.receive(snapshot());
+  const teleported = snapshot(10050);
+  teleported.players[0].x = 3;
+  viewer.receive(teleported);
+  viewer.setTime(10600);
+  assert.equal(viewer.run("interpolatedPosition(envelope.snapshot.players[0], { previousFrame: playerFrames[0], nextFrame: playerFrames[1], blend: 0.5, startupBlend: 1 }).x"), 0);
+  assert.equal(viewer.run('interpolatedPosition(envelope.snapshot.players[0], interpolationFrames()).x'), 3);
+  viewer.run("smoothPlayerPosition({ id: '0' }, { x: 0, z: 0 }, 0.016)");
+  assert.equal(viewer.run("smoothPlayerPosition({ id: '0' }, { x: 3, z: 0 }, 0.016).x"), 3);
+});
+
+test('delayed snapshots expand the buffer and extrapolate only briefly', () => {
+  const viewer = createViewer();
+  viewer.receive(snapshot(10000));
+  const delayed = snapshot(10600);
+  delayed.players[0].x = 1;
+  viewer.receive(delayed);
+  assert.equal(viewer.run('interpolationDelay'), 700);
+  viewer.setTime(11400);
+  const position = viewer.run('interpolatedPosition(envelope.snapshot.players[0], interpolationFrames()).x');
+  assert.ok(position > 1);
+  assert.ok(position < 1.3);
+});
+
+test('delivery jitter preserves the server movement cadence', () => {
+  const viewer = createViewer();
+  viewer.receive(snapshot(10000), 10020);
+  viewer.receive(snapshot(10050), 10120);
+  viewer.receive(snapshot(10100), 10130);
+  const gaps = viewer.run('playerFrames.slice(1).map((frame, i) => frame.at - playerFrames[i].at)');
+  for (const gap of gaps) assert.ok(Math.abs(gap - 50) < 1, 'arrival jitter must not change frame cadence');
+});
+
+test('queued snapshots retain server spacing and diagnostics use actual arrival gaps', () => {
+  const viewer = createViewer(undefined, true);
+  viewer.receive(snapshot(10000), 10000);
+  viewer.receive(snapshot(10050), 10200);
+  viewer.receive(snapshot(10100), 10201);
+  assert.ok(viewer.run('playerFrames[2].at - playerFrames[1].at') > 49);
+  const warning = viewer.metrics.warnings.find(args => args[1] === 'slow snapshot recv');
+  assert.equal(warning[2], 200);
+  assert.equal(viewer.metrics.warnings.length, 1);
+
+  // The receive clock, rather than the delayed animation timeline, determines
+  // whether subsequent delivery has settled and the buffer can shrink again.
+  for (let i = 1; i <= 50; i++) viewer.receive(snapshot(10100 + i * 50), 10201 + i * 50);
+  assert.equal(viewer.run('interpolationDelay'), 250);
+  assert.equal(viewer.run('lastReceivedAt'), 12701);
+});
+
+test('server clock resets on missing state, phase changes and clock rollback', () => {
+  const viewer = createViewer();
+  viewer.receive(snapshot(10000), 10020);
+  viewer.receive(snapshot(10050), 10120);
+  viewer.receive(null);
+  assert.equal(viewer.run('clockOffset'), null);
+  assert.equal(viewer.run('lastReceivedAt'), 0);
+  viewer.receive(snapshot(10100), 10300);
+  assert.equal(viewer.run('clockOffset'), 200);
+  const finished = snapshot(10150);
+  finished.phase = 'finished';
+  viewer.receive(finished, 10500);
+  assert.equal(viewer.run('clockOffset'), 350);
+  assert.equal(viewer.run('playerFrames.length'), 1);
+  viewer.receive({ ...finished, updatedAt: 9000 }, 10600);
+  assert.equal(viewer.run('clockOffset'), 1600);
+  assert.equal(viewer.run('playerFrames[0].at'), 10600);
+});
+
+test('debug frame warnings detect intervals above 25 milliseconds', () => {
+  const viewer = createViewer(undefined, true);
+  viewer.receive(snapshot());
+  viewer.run('draw()');
+  viewer.setTime(10026);
+  viewer.run('draw()');
+  assert.ok(viewer.metrics.warnings.some(args => args[0] === 'slow frame' && args[1] === 26));
 });
 
 test('missing and restarted snapshots clear old interpolation history', () => {

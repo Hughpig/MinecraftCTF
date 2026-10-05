@@ -234,11 +234,20 @@ function isGoalLocked(bot, goal) {
 // cannot be hardcoded with random stands.
 async function waitForHomeGoal(bot) {
   const started = Date.now();
-  while (!stopping && Date.now() - started < 5000) {
+  let walked = false;
+  while (!stopping && Date.now() - started < 20000) {
     const goals = findArenaGoals(bot);
     if (goals.length > 0 && bot.entity) {
       goals.sort((a, b) => a.distanceSquared(bot.entity.position) - b.distanceSquared(bot.entity.position));
       return goals[0];
+    }
+    // From the far enemy side the home goals sit outside the loaded chunks
+    // and the scan comes up empty; walk toward home until one scrolls in.
+    if (!walked && bot.entity) {
+      walked = true;
+      const hs = bot.ctf.team === 'left' ? -1 : 1;
+      await goNear(bot, hs * 2, bot.entity.position.z,
+        () => findArenaGoals(bot).length > 0, { maxDuration: 8000 });
     }
     await sleep(100);
   }
@@ -314,8 +323,11 @@ async function runRoute(bot) {
         // bail out immediately and let the retry pick the next nearest flag.
         const flagTarget = { x: flag.bx, z: flag.bz };
         await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying || isBannerGone(bot, flagTarget));
-        if (!bot.ctf.carrying && isBannerGone(bot, flagTarget)) throw new Error('flag was taken by a teammate');
-        await waitFor(bot, () => bot.ctf.carrying, `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
+        // The banner can vanish between arrival and the server's pickup
+        // confirm; without a live check the bot would stand here as capture
+        // bait for the whole 15s timeout.
+        await waitFor(bot, () => bot.ctf.carrying || isBannerGone(bot, flagTarget), `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
+        if (!bot.ctf.carrying) throw new Error('flag vanished before pickup');
         if (stopping) break;
         const goal = await waitForHomeGoal(bot);
         log(bot.username, `go goal ${goal.x},${goal.z}`);

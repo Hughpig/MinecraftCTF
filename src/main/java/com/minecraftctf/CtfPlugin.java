@@ -455,7 +455,12 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             match.prisonTeam.remove(id);
             match.jailedUntil.remove(id);
             if (player != null) {
-                player.sendMessage(Component.text("监狱门已打开，你已获释。"));
+                // Deterministic exit: walking out can wedge behind the one-block
+                // door (a fresh jail re-closes it, and door-block physics can
+                // stall clients), so place the player just outside their own
+                // door instead of hoping they path out.
+                player.teleport(map.prisonExit(team));
+                player.sendMessage(Component.text("监狱门已打开，你已获释并被送出监狱。"));
                 event("release", Map.of("player", player.getName(), "reason", reason));
             }
         }
@@ -808,25 +813,36 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             for(int z=-36;z<=36;z++) for(int y=64;y<=68;y++){ world.getBlockAt(-24,y,z).setType(Material.STONE_BRICKS, false); world.getBlockAt(24,y,z).setType(Material.STONE_BRICKS, false); }
             for(int z=-36;z<=36;z++) world.getBlockAt(0,63,z).setType(Material.RED_CONCRETE, false);
             Random random = new Random(options.seed());
-            // Trees go in first; stand generation keeps its margin away from the
-            // placed cells, so an obstacle can never overwrite a flag or target.
-            Set<Long> treeCells = switch (options.obstacles()) {
-                case RANDOM -> placeTrees(randomTreeCenters(random));
-                case FIXED -> placeTrees(fixedTreeCenters());
-                case NONE -> new HashSet<>();
-            };
-            // Stands are generated once in distance-from-centre space for the
-            // red half and mirrored across x=0 for the blue half.
-            List<int[]> redTargets = options.randomStands()
-                    ? randomStandCells(random, treeCells, List.of(), 2, true)
-                    : legacyTargets();
-            List<int[]> redFlags = options.randomStands()
-                    ? randomStandCells(random, treeCells, redTargets, 3, false)
-                    : legacyFlags();
+            // Random halves are generated independently — no mirroring — so a
+            // match has two genuinely different layouts. The fixed obstacle
+            // design stays symmetric on purpose (sign 0 = place both sides).
+            Set<Long> treeCells = new HashSet<>();
+            for (Team t : Team.values()) {
+                int sign = t == Team.LEFT ? -1 : 1;
+                switch (options.obstacles()) {
+                    case RANDOM -> treeCells.addAll(placeTrees(randomTreeCenters(random), sign));
+                    case FIXED -> treeCells.addAll(placeTrees(fixedTreeCenters(), 0));
+                    case NONE -> { }
+                }
+            }
+            Map<Team, List<int[]>> teamTargets = new EnumMap<>(Team.class), teamFlags = new EnumMap<>(Team.class);
+            for (Team t : Team.values()) {
+                if (options.randomStands()) {
+                    // Trees go in first; stand generation keeps its margin away
+                    // from the placed cells, so an obstacle can never overwrite
+                    // a flag or target.
+                    List<int[]> goals = randomStandCells(random, treeCells, List.of(), 2, true);
+                    teamTargets.put(t, goals);
+                    teamFlags.put(t, randomStandCells(random, treeCells, goals, 3, false));
+                } else {
+                    teamTargets.put(t, legacyTargets());
+                    teamFlags.put(t, legacyFlags());
+                }
+            }
             for(Team t:Team.values()){
                 int sign=t==Team.LEFT?-1:1; Material wool=t==Team.LEFT?Material.RED_BANNER:Material.BLUE_BANNER;
                 for(int i=0;i<8;i++){
-                    int[] fc=redFlags.get(i), tc=redTargets.get(i);
+                    int[] fc=teamFlags.get(t).get(i), tc=teamTargets.get(t).get(i);
                     Location fl=new Location(world,sign*fc[0],64,fc[1]); fl.getBlock().setType(wool, false); world.getBlockAt(sign*fc[0],65,fc[1]).setType(Material.AIR, false);
                     flags.put(t.id+"-flag-"+(i+1),new Flag(t.id+"-flag-"+(i+1),t,fl,wool,CtfPlugin.this));
                     Location gl=new Location(world,sign*tc[0],63,tc[1]); gl.getBlock().setType(Material.GOLD_BLOCK, false); targets.put(t.id+"-goal-"+(i+1),new Target(t.id+"-goal-"+(i+1),t,gl,CtfPlugin.this));
@@ -885,12 +901,12 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             return false;
         }
 
-        private Set<Long> placeTrees(List<int[]> centers) {
+        private Set<Long> placeTrees(List<int[]> centers, int sign) {
             Set<Long> cells = new HashSet<>();
             for (int[] center : centers) {
-                for (int sign = -1; sign <= 1; sign += 2) {
+                for (int side : sign == 0 ? new int[]{-1, 1} : new int[]{sign}) {
                     for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
-                        int x = center[0] * sign + dx, z = center[1] + dz;
+                        int x = center[0] * side + dx, z = center[1] + dz;
                         cells.add(cellKey(x, z));
                         world.getBlockAt(x, 64, z).setType(Material.OAK_LOG, false);
                         world.getBlockAt(x, 65, z).setType(Material.OAK_LOG, false);
@@ -923,7 +939,10 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         private boolean standCellBlocked(int x, int z, Set<Long> treeCells, List<int[]> placed,
                                          List<int[]> otherType, int otherSpacing) {
             if (inPrisonKeepOut(x, z) || nearSpawnOrLobby(x, z, 0)) return true;
-            if (treeNear(x, z, treeCells, STAND_TREE_MARGIN)) return true;
+            // x is a distance-from-centre value; the cell may be mirrored to
+            // either half, but tree cells are stored in world coordinates —
+            // check both signs or the left half never sees its trees.
+            if (treeNear(x, z, treeCells, STAND_TREE_MARGIN) || treeNear(-x, z, treeCells, STAND_TREE_MARGIN)) return true;
             for (int[] c : placed) if (chebyshev(x, z, c[0], c[1]) < FLAG_STAND_SPACING) return true;
             for (int[] c : otherType) if (chebyshev(x, z, c[0], c[1]) < otherSpacing) return true;
             return false;
@@ -1065,6 +1084,7 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         boolean isHomeHalf(Team t, Location l){return t==Team.LEFT?l.getX()<0:l.getX()>0;} boolean isEnemyHalf(Team t, Location l){return !isHomeHalf(t,l) && Math.abs(l.getX())>1;}
         Location spawn(Team t){return new Location(world,t==Team.LEFT?-12:12,64,0.5, (float)(t==Team.LEFT?Math.PI/2:-Math.PI/2),0);}
         Location prison(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,28.5,180,0);}
+        Location prisonExit(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,23.5,180,0);}
         Location prisonDoor(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,26.5);}
         Location prisonPlate(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,24.5);}
         Location lobby(){return new Location(world,0,64,0.5);}

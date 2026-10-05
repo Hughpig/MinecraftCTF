@@ -616,6 +616,7 @@ canvas.addEventListener('mousemove', event => {
   const cursorX = event.clientX - rect.left, cursorY = event.clientY - rect.top;
   const snapshot = envelope.snapshot;
   const objects = [
+    ...(snapshot.blocks || []).filter(block => block.kind === 'tree').map(block => ({ x: block.x + .5, z: block.z + .5, title: '树木障碍' })),
     ...snapshot.players.map(player => ({ ...player, title: `${player.name} · ${teamNames[player.team]}${player.carrying ? ' · 携旗' : ''}` })),
     ...(snapshot.prisons || []).flatMap(prison => [
       { x: prison.x, z: prison.z, title: `${teamNames[prison.team]}监狱中心` },

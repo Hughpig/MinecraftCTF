@@ -57,3 +57,6 @@ server/permissions.yml
 server/plugins/
 server/spigot.yml
 server/version_history.json
+
+# ZCode session artifacts
+.zcode/

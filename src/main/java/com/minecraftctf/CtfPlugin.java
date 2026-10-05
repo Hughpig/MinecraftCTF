@@ -22,6 +22,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockBreakEvent;
 import org.bukkit.event.block.BlockPlaceEvent;
+import org.bukkit.event.entity.CreatureSpawnEvent;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
@@ -184,6 +185,12 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             viewerTeams.putAll(lobby);
             broadcast("地图已生成：" + describeMapOptions(map.options));
             event("map_setup", mapSetupEvent(map.options, false));
+            // A rebuild invalidates the earlier ready round (the prompt already
+            // fired once and start bounced into this rebuild). Reset and ask
+            // again so the match deterministically starts after the rebuild.
+            lobby.keySet().forEach(id -> ready.put(id, false));
+            readyPrompted = false;
+            maybePromptReady();
         });
     }
 
@@ -238,9 +245,11 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         viewerTeams.put(player.getUniqueId(), team); viewerResult = null;
         player.sendMessage(Component.text("已加入 " + team.label + " 队。当前人数 " + lobby.size() + "，每队上限 " + MAX_TEAM_SIZE + "。"));
         event("lobby_join", Map.of("player", player.getName(), "team", team.id));
-        // Pinned-side clients join via /ctf join before their match message, so
-        // the ready prompt must fire on joins too, not only on match messages.
-        maybePromptReady();
+        // Pinned-side clients join via /ctf join before their match message.
+        // Prompt on joins only once a match request is known (requestedPlayers
+        // > 0): with no request the implied per-team requirement of 1 would
+        // start a 1v1 before the real 3v3 request ever arrives.
+        if (requestedPlayers > 0) maybePromptReady();
         return true;
     }
 
@@ -654,7 +663,27 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         Location to = e.getTo();
         if (to != null && (Math.abs(to.getX()) > 24 || Math.abs(to.getZ()) > 36 || to.getY() < 62 || to.getY() > 80)) e.setTo(e.getFrom());
     }
-    @EventHandler public void onDamage(EntityDamageEvent e) { if (e.getEntity() instanceof Player p && match != null && match.players.containsKey(p.getUniqueId())) { if (!(e instanceof EntityDamageByEntityEvent)) e.setCancelled(true); } }
+    @EventHandler public void onDamage(EntityDamageEvent e) {
+        if (!(e.getEntity() instanceof Player p)) return;
+        boolean inMatch = match != null && match.players.containsKey(p.getUniqueId());
+        boolean inLobby = match == null && arenaWorld != null && arenaWorld.equals(p.getWorld())
+                && (lobby.containsKey(p.getUniqueId()) || viewerTeams.containsKey(p.getUniqueId()));
+        if (!inMatch && !inLobby) return;
+        if (e instanceof EntityDamageByEntityEvent) {
+            // Match players fight at fixed damage; lobby players take no damage
+            // at all so monsters and stray hits cannot kill them pre-match.
+            if (!inMatch) e.setCancelled(true);
+            return;
+        }
+        e.setCancelled(true);
+    }
+
+    @EventHandler public void onCreatureSpawn(CreatureSpawnEvent e) {
+        if (arenaWorld != null && e.getLocation().getWorld().equals(arenaWorld)
+                && e.getSpawnReason() != CreatureSpawnEvent.SpawnReason.COMMAND
+                && e.getSpawnReason() != CreatureSpawnEvent.SpawnReason.CUSTOM)
+            e.setCancelled(true);
+    }
     @EventHandler public void onEntityDamage(EntityDamageByEntityEvent e) { if (e.getEntity() instanceof Player victim && match != null && match.players.containsKey(victim.getUniqueId())) { if (e.getDamager() instanceof Player attacker && match.players.containsKey(attacker.getUniqueId())) { e.setDamage(1.0); } else e.setCancelled(true); } }
     @EventHandler public void onBreak(BlockBreakEvent e) { if (match != null && match.players.containsKey(e.getPlayer().getUniqueId())) e.setCancelled(true); }
     @EventHandler public void onPlace(BlockPlaceEvent e) { if (match != null && match.players.containsKey(e.getPlayer().getUniqueId())) e.setCancelled(true); }

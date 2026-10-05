@@ -10,6 +10,7 @@
     "walk": "node scripts/run-local-bots.js",
     "local-3v3": "node scripts/run-local-bots.js",
     "walk-smart": "node scripts/run-walk-smart.js",
+    "jump-smart": "node scripts/run-jump-smart.js",
     "free-mover": "node scripts/run-free-mover.js"
   },
   "dependencies": {

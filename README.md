@@ -277,9 +277,12 @@ npm run launch -- --red 2:smart,1:simple --blue 3:smart --map random --seed 42
 
 # 红队单队测试（enemy:none），1 个 walk-smart
 npm run launch -- --red 1:smart --enemy none
+
+# 红队全部 jump-smart 对蓝队 walk-smart
+npm run launch -- --red 3:jump --blue 3:smart --map random
 ```
 
-参数：`--red` / `--blue` 为 `数量:smart|simple` 逗号分隔的混编列表；`--map fixed|random`；`--obstacles 0|fixed|random`；`--stands fixed|random`；`--seed 整数`；`--enemy none` 切换单队测试。固定阵营的 bot 使用 `RS_/RX_/BS_/BX_` 前缀用户名（红/蓝 × smart/simple），同一局内的用户名互不冲突。
+参数：`--red` / `--blue` 为 `数量:smart|jump|simple` 逗号分隔的混编列表；`--map fixed|random`；`--obstacles 0|fixed|random`；`--stands fixed|random`；`--seed 整数`；`--enemy none` 切换单队测试。固定阵营的 bot 使用 `RS_/RJ_/RX_/BS_/BJ_/BX_` 前缀用户名（红/蓝 × smart/jump/simple），同一局内的用户名互不冲突。
 
 bot 脚本可用的环境变量（启动器会自动设置，也可手动覆盖）：
 
@@ -301,6 +304,15 @@ walk-smart 额外的对抗行为：
 - 防守角色与巡逻中的 bot 在己方半场发现敌方玩家即追捕；
 - 进攻 bot 未携旗回城途中若 6 格内有敌方玩家，先进行最多 6 秒的追捕再继续夺旗路线；
 - 携旗或身处敌方半场时，躲闪半径从 3.5 格扩大到 4.5 格、持续时间更长，且躲闪方向为远离对手的一侧。
+
+### jump-smart
+
+`npm run jump-smart` 或启动器里的 `数量:jump`。在 walk-smart 的全部能力之上：
+
+- **移动**：疾跑 + 连续跳跃（最快地面速度），接近旗座/目标/压力板 2 格内自动减速为步行保证精度；
+- **目标动态分配**：同队 bot 共享一张认领表（15 秒租约、被抓即释放），每次都认领"未被队友认领的最近活旗"，两 bot 不会追同一面旗而放空其余；目标全部有主时协助最近的；
+- **队友营救**：感知队友被抓后，最近的空闲 bot（携旗者除外）前往己方监狱压力板踩板开门，确认门开后回归岗位；30 秒计时开门同样能识别；
+- 防守/巡逻/追捕/逃逸行为与 walk-smart 相同。
 
 ## 单队自由移动 viewer 测试
 

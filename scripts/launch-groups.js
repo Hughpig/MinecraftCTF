@@ -5,17 +5,18 @@
 
 const path = require('node:path');
 
-const SCRIPTS = { smart: 'walk_smart_bot_test.js', simple: 'local_bot_test.js' };
+const SCRIPTS = { smart: 'walk_smart_bot_test.js', simple: 'local_bot_test.js', jump: 'jump_smart_bot_test.js' };
+const STYLE_LETTERS = { smart: 'S', simple: 'X', jump: 'J' };
 const STYLES = Object.keys(SCRIPTS);
 
 function parseTeamSpec(spec) {
-  // "2:smart,1:simple" -> {smart: 2, simple: 1}
-  const counts = { smart: 0, simple: 0 };
+  // "2:smart,1:simple,1:jump" -> {smart: 2, simple: 1, jump: 1}
+  const counts = { smart: 0, simple: 0, jump: 0 };
   for (const part of String(spec || '').split(',')) {
     const trimmed = part.trim();
     if (!trimmed) continue;
-    const match = trimmed.match(/^(\d+):(smart|simple)$/i);
-    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|simple，例如 2:smart,1:simple`);
+    const match = trimmed.match(/^(\d+):(smart|simple|jump)$/i);
+    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|simple|jump，例如 2:smart,1:jump`);
     counts[match[2].toLowerCase()] += Number(match[1]);
   }
   return counts;
@@ -38,7 +39,7 @@ function composeGroups(config) {
   const teams = config.mode === 'red'
     ? [['left', config.red]]
     : [['left', config.red], ['right', config.blue]];
-  const totals = teams.map(([, counts]) => (counts.smart || 0) + (counts.simple || 0));
+  const totals = teams.map(([, counts]) => STYLES.reduce((sum, style) => sum + (counts[style] || 0), 0));
   if (totals.some(total => total <= 0)) throw new Error('至少需要一名 bot 才能开局');
   const players = Math.min(...totals);
   const mapExtra = composeMapExtra(config.map || {});
@@ -49,7 +50,7 @@ function composeGroups(config) {
     for (const style of STYLES) {
       const count = counts[style] || 0;
       if (count <= 0) continue;
-      const prefix = `${side === 'left' ? 'R' : 'B'}${style === 'smart' ? 'S' : 'X'}`;
+      const prefix = `${side === 'left' ? 'R' : 'B'}${STYLE_LETTERS[style]}`;
       groups.push({
         side,
         style,

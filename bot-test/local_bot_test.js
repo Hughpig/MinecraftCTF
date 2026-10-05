@@ -3,17 +3,24 @@ const { Vec3 } = require('vec3');
 const loopDiagnostics = require('./loop-diagnostics')();
 const findArenaFlags = require('./arena-flag-search');
 const waitForInitialWorld = require('./startup-world');
+const { planSteer, makeBlockProbe } = require('./ctf-steer');
 
 const HOST = process.env.CTF_HOST || '127.0.0.1';
 const PORT = Number(process.env.CTF_PORT || 25565);
 const BOT_COUNT = Math.max(1, Math.min(16, Number(process.env.CTF_BOTS || 2)));
 const PLAYERS_PER_TEAM = Math.max(1, Math.min(16, Number(process.env.CTF_PLAYERS || 1)));
-const ACTIVE_TEAM = process.env.CTF_ACTIVE_TEAM || 'both';
+const TEAM_SIDE = (process.env.CTF_TEAM_SIDE || '').toLowerCase();
+const ACTIVE_TEAMS = TEAM_SIDE || process.env.CTF_ACTIVE_TEAM || 'both';
+const NAME_PREFIX = process.env.CTF_NAME_PREFIX || 'LocalCTF';
+const MAP_MODE = process.env.CTF_MAP_MODE || 'fixed';
+const MATCH_EXTRA = (process.env.CTF_MATCH_EXTRA || '').trim();
+const ENEMY = process.env.CTF_ENEMY || 'bot';
+const SEND_SETUP = process.env.CTF_SETUP !== '0';
 const VIEW_DISTANCE = Number(process.env.CTF_BOT_VIEW_DISTANCE ?? 3);
 const LOGIN_STAGGER_MS = Number(process.env.CTF_BOT_LOGIN_STAGGER_MS ?? 250);
 if (!Number.isInteger(VIEW_DISTANCE) || VIEW_DISTANCE < 2 || VIEW_DISTANCE > 32) throw new Error('CTF_BOT_VIEW_DISTANCE must be an integer between 2 and 32');
 if (!Number.isFinite(LOGIN_STAGGER_MS) || LOGIN_STAGGER_MS < 0 || LOGIN_STAGGER_MS > 5000) throw new Error('CTF_BOT_LOGIN_STAGGER_MS must be between 0 and 5000');
-const MATCH = `match team:local-bots enemy:bot players:${PLAYERS_PER_TEAM} map:fixed`;
+const MATCH = `match team:${NAME_PREFIX.toLowerCase()} enemy:${ENEMY} players:${PLAYERS_PER_TEAM} map:${MAP_MODE}${MATCH_EXTRA ? ' ' + MATCH_EXTRA : ''}`;
 const FLAG_APPROACH_OFFSET = 1.25;
 const bots = [];
 let stopping = false;
@@ -26,7 +33,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const log = (name, message) => console.log(`[${new Date().toISOString()}] [${name}] ${message}`);
 
 function makeBot(index) {
-  const username = `LocalCTF_${index + 1}`;
+  const username = `${NAME_PREFIX}_${index + 1}`;
   const bot = mineflayer.createBot({ host: HOST, port: PORT, username, auth: 'offline', version: '1.21.8', viewDistance: VIEW_DISTANCE });
   bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, pickups: 0, captures: 0 };
 
@@ -54,7 +61,7 @@ function makeBot(index) {
             testTimeout = setTimeout(() => { log('smoke', 'test deadline exceeded'); stopAll(); }, 210000);
           }
           bot.ctf.started = true;
-          if (ACTIVE_TEAM === 'both' || ACTIVE_TEAM === bot.ctf.team) {
+          if (ACTIVE_TEAMS === 'both' || ACTIVE_TEAMS === bot.ctf.team) {
             runRoute(bot).catch(err => {
               bot.ctf.routeFailed = true;
               bot.clearControlStates();
@@ -86,7 +93,7 @@ function makeBot(index) {
   return bot;
 }
 
-async function goNear(bot, x, z, completed = () => false) {
+async function goNear(bot, x, z, completed = () => false, options = {}) {
   bot.clearControlStates();
   let started = Date.now();
   let lastLog = 0;
@@ -95,8 +102,14 @@ async function goNear(bot, x, z, completed = () => false) {
   let lastProgress = Date.now();
   let nudgeUntil = 0;
   let nudgeLeft = false;
+  let detour = null;
+  let stallCount = 0;
+  let unstickUntil = 0;
+  let unstickPoint = null;
+  const maxDuration = options.maxDuration || 20000;
   const target = new Vec3(x, 64, z);
-  while (!stopping && Date.now() - started < 20000) {
+  const probe = makeBlockProbe(bot);
+  while (!stopping && Date.now() - started < maxDuration) {
     if (completed()) { bot.clearControlStates(); return true; }
     if (bot.ctf.jailed) {
       bot.clearControlStates();
@@ -114,21 +127,44 @@ async function goNear(bot, x, z, completed = () => false) {
       lastX = position.x;
       lastZ = position.z;
       lastProgress = Date.now();
+      stallCount = 0;
     } else if (Date.now() - lastProgress > 1200 && nudgeUntil < Date.now()) {
+      stallCount++;
       nudgeLeft = !nudgeLeft;
       nudgeUntil = Date.now() + 550;
       lastProgress = Date.now();
+      // Wedged in a corner between clusters: walk backwards briefly to leave
+      // the pocket, then re-plan fresh.
+      if (stallCount >= 2 && unstickUntil < Date.now()) {
+        const steerLen = Math.hypot(deltaX, deltaZ) || 1;
+        unstickPoint = { x: position.x - deltaX / steerLen * 1.6, z: position.z - deltaZ / steerLen * 1.6 };
+        unstickUntil = Date.now() + 1200;
+        detour = null;
+        stallCount = 0;
+      }
     }
-    await bot.lookAt(new Vec3(target.x, position.y + 1.62, target.z), true);
+    let steerPoint;
+    if (unstickUntil > Date.now() && unstickPoint) {
+      steerPoint = unstickPoint;
+    } else {
+      const steer = planSteer({ position, target, detour, probe });
+      detour = steer.detour;
+      steerPoint = steer.steerPoint;
+    }
+    const steerDeltaX = steerPoint.x - position.x;
+    const steerDeltaZ = steerPoint.z - position.z;
+    const steerDistance = Math.hypot(steerDeltaX, steerDeltaZ) || 1;
+    await bot.lookAt(new Vec3(steerPoint.x, position.y + 1.62, steerPoint.z), true);
     bot.setControlState('forward', true);
     bot.setControlState('sprint', false);
     bot.setControlState('left', nudgeUntil > Date.now() && nudgeLeft);
     bot.setControlState('right', nudgeUntil > Date.now() && !nudgeLeft);
-    const ahead = bot.blockAt(position.offset(deltaX / Math.max(distance, 0.01) * 0.8, 0.1, deltaZ / Math.max(distance, 0.01) * 0.8));
+    const ahead = bot.blockAt(position.offset(steerDeltaX / steerDistance * 0.8, 0.1, steerDeltaZ / steerDistance * 0.8));
     // Do not jump during the final approach to a flag/target. The server confirms
     // a pickup before the client reaches the block, so jumping here only makes the
-    // bot brush the fence and appear to pause beside the flag.
-    bot.setControlState('jump', distance > 1.2 && !!ahead && ahead.boundingBox === 'block');
+    // bot brush the fence and appear to pause beside the flag. Two-high trees are
+    // handled by the detour, where jumping cannot help.
+    bot.setControlState('jump', !detour && distance > 1.2 && !!ahead && ahead.boundingBox === 'block');
     if (Date.now() - lastLog > 5000) { lastLog = Date.now(); log(bot.username, `position ${bot.entity.position.x.toFixed(1)},${bot.entity.position.y.toFixed(1)},${bot.entity.position.z.toFixed(1)}`); }
     await sleep(100);
   }
@@ -183,7 +219,15 @@ async function leavePrison(bot) {
     && Math.abs(bot.entity.position.x) >= 12 && Math.abs(bot.entity.position.x) <= 20;
   if (!inside) return;
   const doorX = bot.ctf.team === 'left' ? -15.5 : 16.5;
-  await goNear(bot, doorX, 23.5);
+  // Same two-phase exit as walk-smart: never detour or dodge inside the ring;
+  // push along the doorway axis and wait out a freshly closed door.
+  for (let attempt = 0; attempt < 6 && !stopping; attempt++) {
+    await goNear(bot, doorX, 26.4, () => false, { noDetour: true, maxDuration: 9000 });
+    const outside = await goNear(bot, doorX, 23.5, () => false, { noDetour: true, maxDuration: 15000 })
+      .then(() => true)
+      .catch(() => false);
+    if (outside) return;
+  }
 }
 
 async function patrolAfterRoute(bot) {
@@ -216,26 +260,38 @@ async function runRoute(bot) {
     const flagX = -homeSign * (flagIndex < 4 ? 18 : 10);
     const goalX = homeSign * (routeIndex < 4 ? 4 : 7);
     let captured = false;
-    let recoveringDroppedFlag = false;
-    while (!stopping && !captured) {
-      await waitForRelease(bot);
-      await leavePrison(bot);
-      const flag = recoveringDroppedFlag
-        ? await waitForEnemyFlag(bot, flagX, z, homeSign)
-        : { x: flagX + homeSign * FLAG_APPROACH_OFFSET, z: z + 0.3 };
-      log(bot.username, `go flag ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
-      await goNear(bot, homeSign * 2, bot.entity.position.z);
-      await goNear(bot, homeSign * 2, flag.z);
-      await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying);
-      await waitFor(bot, () => bot.ctf.carrying, `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
-      if (stopping) break;
-      log(bot.username, `go goal ${goalX},${z}`);
-      const previousCaptures = bot.ctf.captures;
-      await goNear(bot, goalX + 0.3, z + 0.3, () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying);
-      captured = bot.ctf.captures > previousCaptures;
-      recoveringDroppedFlag = !captured;
-      if (recoveringDroppedFlag && !stopping) log(bot.username, 'flag lost after capture; retrying after release');
+    let attempts = 0;
+    while (!stopping && !captured && attempts < 4) {
+      attempts++;
+      let flag = null;
+      try {
+        await waitForRelease(bot);
+        await leavePrison(bot);
+        // Always locate the live banner: random stands and dropped flags both
+        // move it away from the fixed-map origins.
+        flag = await waitForEnemyFlag(bot, flagX, z, homeSign);
+        log(bot.username, `go flag ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
+        await goNear(bot, homeSign * 2, bot.entity.position.z);
+        await goNear(bot, homeSign * 2, flag.z);
+        await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying);
+        await waitFor(bot, () => bot.ctf.carrying, `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
+        if (stopping) break;
+        log(bot.username, `go goal ${goalX},${z}`);
+        const previousCaptures = bot.ctf.captures;
+        await goNear(bot, goalX + 0.3, z + 0.3, () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying);
+        captured = bot.ctf.captures > previousCaptures;
+        if (!captured && !stopping) log(bot.username, 'flag lost after capture; retrying after release');
+      } catch (err) {
+        if (stopping) break;
+        bot.clearControlStates();
+        if (bot.ctf.carrying) {
+          try { await goNear(bot, goalX + 0.3, z + 0.3, () => !bot.ctf.carrying, { maxDuration: 10000 }); } catch (_) { bot.clearControlStates(); }
+        }
+        log(bot.username, `route attempt ${attempts}/4 failed; retrying live flag: ${err.message}`);
+        await sleep(250);
+      }
     }
+    if (!captured && !stopping) log(bot.username, `route target ${routeIndex} skipped after ${attempts} attempts`);
   }
   // Keep the demo players visibly active after their assigned flags are gone.
   // Without this, a bot naturally stops at its last target and looks frozen.
@@ -270,7 +326,7 @@ async function startBots() {
       waitForInitialWorld(bot, { isStopping: () => stopping })
         .then(() => log(bot.username, 'startup terrain loaded'))
     );
-    if (i === 0) {
+    if (i === 0 && SEND_SETUP) {
       // The map is restored from the built arena at plugin enable, so setup
       // only needs a spawned player, not fully streamed terrain.
       bot.once('spawn', () => { if (!stopping) bot.chat('/ctf setup'); });
@@ -280,9 +336,20 @@ async function startBots() {
   if (stopping) return;
   await Promise.all(terrainReady);
   if (stopping) return;
-  await mapReady;
+  // Only the setup-sending group waits for the map broadcast; other groups can
+  // miss it (they log in after it fired), and match start handles the map itself.
+  if (SEND_SETUP) await mapReady;
   // Let Paper settle the last login before match preparation/teleports begin.
   await sleep(2000);
+  if (TEAM_SIDE) {
+    // Pinned side (launcher mixed teams): join explicitly so the match message
+    // does not rely on server auto-balancing.
+    for (const bot of bots) {
+      if (stopping) return;
+      bot.chat(`/ctf join ${TEAM_SIDE}`);
+      await sleep(150);
+    }
+  }
   for (const bot of bots) {
     if (stopping) return;
     bot.chat(MATCH);

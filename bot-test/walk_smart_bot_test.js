@@ -36,7 +36,7 @@ function makeBot(index) {
 
   bot.on('messagestr', message => {
     log(username, message);
-    if (message.includes('固定地图已生成：') || message.includes('固定地图已就绪：')) {
+    if (message.includes('地图已生成：') || message.includes('地图已就绪：')) {
       confirmMapReady();
     }
     if (message.includes('Are you ready?')) bot.chat("I'm ready!");

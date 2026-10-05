@@ -1,5 +1,7 @@
 package com.minecraftctf;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
 import net.kyori.adventure.text.Component;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
@@ -65,6 +67,8 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     private BukkitTask tickTask;
     private final Map<UUID, Team> lobby = new LinkedHashMap<>();
     private final Map<UUID, Boolean> ready = new ConcurrentHashMap<>();
+    private final Gson gson = new Gson();
+    private MapOptions requestedMapOptions = MapOptions.LEGACY;
     private int requestedPlayers = 0;
     private boolean allowEmptyOpponent = false;
     private String requestedMapMode = "fixed";
@@ -101,7 +105,10 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         if (arenaWorld != null) {
             arenaWorld.setStorm(false); arenaWorld.setThundering(false); arenaWorld.setTime(6000);
             map = new ArenaMap(arenaWorld);
-            if (map.restoreExisting()) {
+            // Only the legacy fixed layout can be fast-restored from world
+            // markers; parameterised layouts rebuild on the next setup or start.
+            MapOptions persisted = loadMapOptions();
+            if (persisted.obstacles() == ObstacleMode.NONE && !persisted.randomStands() && map.restoreExisting()) {
                 map.resetState();
                 viewerMapVersion = 1;
             }
@@ -139,31 +146,88 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     }
 
     void setupMap() {
+        // /ctf setup keeps whatever parameterised map is already built; it only
+        // builds the pending request (legacy by default) when nothing exists.
+        // Match start drives rebuilds when the request options differ.
+        if (map != null && map.built) {
+            setupMap(map.options);
+            return;
+        }
+        setupMap(requestedMapOptions);
+    }
+
+    void setupMap(MapOptions options) {
         if (arenaWorld == null) return;
         if (mapBuildTask != null) return;
         if (match != null) finish("map_reset");
         if (map == null) map = new ArenaMap(arenaWorld);
-        if (map.built) {
+        if (map.built && map.options.sameLayout(options)) {
             map.resetState();
             viewerMapVersion++;
             viewerCapturedFlags.clear();
             viewerResult = null;
             viewerTeams.clear();
             viewerTeams.putAll(lobby);
-            broadcast("固定地图已就绪：世界 " + ARENA_WORLD + "，中央标记线 x=0，可通行。");
-            event("map_setup", Map.of("world", ARENA_WORLD, "mode", "fixed", "reused", true));
+            broadcast("地图已就绪：" + describeMapOptions(map.options));
+            event("map_setup", mapSetupEvent(map.options, true));
             return;
         }
-        mapBuildTask = map.startBuild(() -> {
+        MapOptions buildOptions = options.withConcreteSeed(
+                options.seed() != null ? options.seed() : System.currentTimeMillis());
+        broadcast("正在生成地图：" + describeMapOptions(buildOptions));
+        mapBuildTask = map.startBuild(buildOptions, () -> {
             mapBuildTask = null;
             viewerMapVersion++;
             viewerCapturedFlags.clear();
             viewerResult = null;
             viewerTeams.clear();
             viewerTeams.putAll(lobby);
-            broadcast("固定地图已生成：世界 " + ARENA_WORLD + "，中央标记线 x=0，可通行。");
-            event("map_setup", Map.of("world", ARENA_WORLD, "mode", "fixed"));
+            broadcast("地图已生成：" + describeMapOptions(map.options));
+            event("map_setup", mapSetupEvent(map.options, false));
         });
+    }
+
+    private String describeMapOptions(MapOptions options) {
+        return "世界 " + ARENA_WORLD + "，障碍 " + options.obstacles().name().toLowerCase(Locale.ROOT)
+                + "，旗座 " + (options.randomStands() ? "random" : "fixed")
+                + "，种子 " + options.seed() + "，中央标记线 x=0，可通行。";
+    }
+
+    private Map<String, Object> mapSetupEvent(MapOptions options, boolean reused) {
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("world", ARENA_WORLD);
+        data.put("mode", requestedMapMode);
+        data.put("reused", reused);
+        data.put("obstacles", options.obstacles().name().toLowerCase(Locale.ROOT));
+        data.put("stands", options.randomStands() ? "random" : "fixed");
+        data.put("seed", options.seed());
+        return data;
+    }
+
+    private void persistMapOptions(MapOptions options) {
+        try {
+            JsonObject json = new JsonObject();
+            json.addProperty("obstacles", options.obstacles().name());
+            json.addProperty("randomStands", options.randomStands());
+            json.addProperty("seed", options.seed());
+            Files.writeString(getDataFolder().toPath().resolve("map-options.json"), gson.toJson(json));
+        } catch (IOException e) {
+            getLogger().warning("map-options persist failed: " + e.getMessage());
+        }
+    }
+
+    private MapOptions loadMapOptions() {
+        try {
+            Path file = getDataFolder().toPath().resolve("map-options.json");
+            if (!Files.exists(file)) return MapOptions.LEGACY;
+            JsonObject json = gson.fromJson(Files.readString(file), JsonObject.class);
+            ObstacleMode obstacles = ObstacleMode.valueOf(json.get("obstacles").getAsString());
+            boolean randomStands = json.get("randomStands").getAsBoolean();
+            Long seed = json.get("seed").isJsonNull() ? null : json.get("seed").getAsLong();
+            return new MapOptions(obstacles, randomStands, seed);
+        } catch (Exception e) {
+            return MapOptions.LEGACY;
+        }
     }
 
     boolean join(Player player, Team team) {
@@ -186,11 +250,10 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     }
 
     boolean start() {
-        if (map == null || !map.built) {
-            setupMap();
+        if (map == null || !map.built || !map.options.sameLayout(requestedMapOptions)) {
+            setupMap(requestedMapOptions);
             return false;
         }
-        if (requestedMapMode.equals("random")) broadcast("当前 MVP 尚未启用随机地图，本局使用 fixed 固定坐标。" );
         int required = requestedPlayers > 0 ? requestedPlayers : 1;
         boolean singleTeam = allowEmptyOpponent && teamCount(Team.RIGHT) == 0;
         if (teamCount(Team.LEFT) < required || (!singleTeam && teamCount(Team.RIGHT) < required)) {
@@ -410,7 +473,7 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         for (UUID id : match.players.keySet()) { Player p = Bukkit.getPlayer(id); if (p != null) p.sendMessage(Component.text("Game over!")); }
         event("match_end", Map.of("reason", reason, "left", left, "right", right, "result", result));
         for (UUID id : match.players.keySet()) { Player p = Bukkit.getPlayer(id); if (p != null) { dropCarriedFlag(p, "match_end"); p.setCollidable(true); clearCombatInventory(p); p.getInventory().setArmorContents(new ItemStack[4]); p.setGameMode(GameMode.ADVENTURE); p.teleport(map.lobby()); } }
-        match = null; lobby.clear(); ready.clear(); requestedPlayers = 0; allowEmptyOpponent = false; requestedMapMode = "fixed"; readyPrompted = false;
+        match = null; lobby.clear(); ready.clear(); requestedPlayers = 0; allowEmptyOpponent = false; requestedMapMode = "fixed"; requestedMapOptions = MapOptions.LEGACY; readyPrompted = false;
     }
 
     private void broadcast(String msg) { Bukkit.broadcast(Component.text("[CTF] " + msg)); }
@@ -513,6 +576,28 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         return out;
     }
 
+    private MapOptions parseMapOptions(Map<String, String> request, String mapMode) {
+        // map:random is the preset for obstacles=random plus random stands; the
+        // explicit keys override the preset. Unknown values fall back with a log.
+        ObstacleMode obstacles = mapMode.equals("random") ? ObstacleMode.RANDOM : ObstacleMode.NONE;
+        String obstaclesRaw = request.getOrDefault("obstacles", "");
+        if (!obstaclesRaw.isEmpty()) {
+            if (obstaclesRaw.equals("random")) obstacles = ObstacleMode.RANDOM;
+            else if (obstaclesRaw.equals("fixed")) obstacles = ObstacleMode.FIXED;
+            else if (obstaclesRaw.equals("0") || obstaclesRaw.equals("off") || obstaclesRaw.equals("none")) obstacles = ObstacleMode.NONE;
+            else getLogger().warning("未知的 obstacles 参数 " + obstaclesRaw + "，按默认处理。");
+        }
+        boolean randomStands = mapMode.equals("random") || request.getOrDefault("stands", "").equalsIgnoreCase("random");
+        Long seed = null;
+        String seedRaw = request.getOrDefault("seed", "");
+        if (!seedRaw.isEmpty()) {
+            try { seed = Long.parseLong(seedRaw); } catch (NumberFormatException ignored) {
+                getLogger().warning("未知的 seed 参数 " + seedRaw + "，改用随机种子。");
+            }
+        }
+        return new MapOptions(obstacles, randomStands, seed);
+    }
+
     private boolean lobbyReadyToPrompt() {
         int required = requestedPlayers > 0 ? requestedPlayers : 1;
         return teamCount(Team.LEFT) >= required && (allowEmptyOpponent ? teamCount(Team.RIGHT) == 0 : teamCount(Team.RIGHT) >= required);
@@ -532,6 +617,7 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             Bukkit.getScheduler().runTask(this, () -> {
                 try { requestedPlayers = Math.max(1, Math.min(MAX_TEAM_SIZE, Integer.parseInt(request.getOrDefault("players", "1")))); } catch (NumberFormatException ignored) { requestedPlayers = 1; }
                 requestedMapMode = request.getOrDefault("map", "fixed").toLowerCase(Locale.ROOT);
+                requestedMapOptions = parseMapOptions(request, requestedMapMode);
                 allowEmptyOpponent = request.getOrDefault("enemy", "any").equalsIgnoreCase("none");
                 if (!lobby.containsKey(e.getPlayer().getUniqueId())) {
                     Team suggested = allowEmptyOpponent ? Team.LEFT : (teamCount(Team.LEFT) <= teamCount(Team.RIGHT) ? Team.LEFT : Team.RIGHT);
@@ -577,6 +663,20 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
 
     enum Team { LEFT("left", "左"), RIGHT("right", "右"); final String id, label; Team(String id, String label){this.id=id;this.label=label;} Team other(){return this==LEFT?RIGHT:LEFT;} }
 
+    enum ObstacleMode { NONE, FIXED, RANDOM }
+
+    // Map layout request carried through the match chat protocol. A null seed
+    // means "keep the current layout when only the modes match"; a concrete
+    // seed is stored with the built map so requests can pin a layout.
+    record MapOptions(ObstacleMode obstacles, boolean randomStands, Long seed) {
+        static final MapOptions LEGACY = new MapOptions(ObstacleMode.NONE, false, null);
+        MapOptions withConcreteSeed(long concreteSeed) { return new MapOptions(obstacles, randomStands, concreteSeed); }
+        boolean sameLayout(MapOptions built) {
+            return obstacles == built.obstacles && randomStands == built.randomStands
+                    && (seed == null || built.seed == null || seed.equals(built.seed));
+        }
+    }
+
     static final class Match {
         final Map<UUID, Team> players = new LinkedHashMap<>();
         final long start = System.currentTimeMillis();
@@ -605,12 +705,20 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     }
 
     final class ArenaMap {
+        // Hand-designed obstacle layout for obstacles:fixed, in distance-from-
+        // centre space (red half mirrors to blue across x=0). Kept clear of the
+        // legacy flag/target rows, prisons, spawns and the centre strip.
+        static final int[][] FIXED_TREE_CENTERS = {{14, -26}, {21, -14}, {13, -9}, {14, 18}};
+        static final int STAND_TREE_MARGIN = 1;
+        static final int FLAG_STAND_SPACING = 4;
         final World world; final Map<String,Flag> flags=new LinkedHashMap<>(); final Map<String,Target> targets=new LinkedHashMap<>(); boolean built;
+        MapOptions options = MapOptions.LEGACY.withConcreteSeed(0);
         final List<Map<String, Object>> viewerBlocks = new ArrayList<>();
         final int[] zs={-30,-22,-14,-6,6,14,22,30};
         ArenaMap(World world){this.world=world;}
         boolean restoreExisting() {
             if (world.getBlockAt(0, 63, 0).getType() != Material.QUARTZ_BLOCK) return false;
+            options = MapOptions.LEGACY.withConcreteSeed(0);
             flags.clear(); targets.clear(); viewerBlocks.clear();
             for (Team t : Team.values()) {
                 int sign = t == Team.LEFT ? -1 : 1;
@@ -631,7 +739,8 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             built = true;
             return true;
         }
-        BukkitTask startBuild(Runnable complete) {
+        BukkitTask startBuild(MapOptions buildOptions, Runnable complete) {
+            options = buildOptions;
             flags.clear(); targets.clear(); viewerBlocks.clear(); built = false;
             // The arena only occupies y=62..68. Clearing the unused air above
             // it multiplied setup work by more than three without changing the
@@ -666,13 +775,29 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             for(int x=-24;x<=24;x++) for(int y=64;y<=68;y++){ world.getBlockAt(x,y,-36).setType(Material.STONE_BRICKS, false); world.getBlockAt(x,y,36).setType(Material.STONE_BRICKS, false); }
             for(int z=-36;z<=36;z++) for(int y=64;y<=68;y++){ world.getBlockAt(-24,y,z).setType(Material.STONE_BRICKS, false); world.getBlockAt(24,y,z).setType(Material.STONE_BRICKS, false); }
             for(int z=-36;z<=36;z++) world.getBlockAt(0,63,z).setType(Material.RED_CONCRETE, false);
+            Random random = new Random(options.seed());
+            // Trees go in first; stand generation keeps its margin away from the
+            // placed cells, so an obstacle can never overwrite a flag or target.
+            Set<Long> treeCells = switch (options.obstacles()) {
+                case RANDOM -> placeTrees(randomTreeCenters(random));
+                case FIXED -> placeTrees(fixedTreeCenters());
+                case NONE -> new HashSet<>();
+            };
+            // Stands are generated once in distance-from-centre space for the
+            // red half and mirrored across x=0 for the blue half.
+            List<int[]> redTargets = options.randomStands()
+                    ? randomStandCells(random, treeCells, List.of(), 2, true)
+                    : legacyTargets();
+            List<int[]> redFlags = options.randomStands()
+                    ? randomStandCells(random, treeCells, redTargets, 3, false)
+                    : legacyFlags();
             for(Team t:Team.values()){
-                int sign=t==Team.LEFT?-1:1; Material wool=t==Team.LEFT?Material.RED_BANNER:Material.BLUE_BANNER; int x1=sign*18, x2=sign*10;
+                int sign=t==Team.LEFT?-1:1; Material wool=t==Team.LEFT?Material.RED_BANNER:Material.BLUE_BANNER;
                 for(int i=0;i<8;i++){
-                    int x=i<4?x1:x2, z=zs[i%4];
-                    Location fl=new Location(world,x,64,z); fl.getBlock().setType(wool, false); world.getBlockAt(x,65,z).setType(Material.AIR, false);
+                    int[] fc=redFlags.get(i), tc=redTargets.get(i);
+                    Location fl=new Location(world,sign*fc[0],64,fc[1]); fl.getBlock().setType(wool, false); world.getBlockAt(sign*fc[0],65,fc[1]).setType(Material.AIR, false);
                     flags.put(t.id+"-flag-"+(i+1),new Flag(t.id+"-flag-"+(i+1),t,fl,wool,CtfPlugin.this));
-                    int gx=sign* (i<4?4:7); Location gl=new Location(world,gx,63,z); gl.getBlock().setType(Material.GOLD_BLOCK, false); targets.put(t.id+"-goal-"+(i+1),new Target(t.id+"-goal-"+(i+1),t,gl,CtfPlugin.this));
+                    Location gl=new Location(world,sign*tc[0],63,tc[1]); gl.getBlock().setType(Material.GOLD_BLOCK, false); targets.put(t.id+"-goal-"+(i+1),new Target(t.id+"-goal-"+(i+1),t,gl,CtfPlugin.this));
                 }
                 buildPrison(t);
                 Material teamMarker = t == Team.LEFT ? Material.RED_WOOL : Material.BLUE_WOOL;
@@ -681,14 +806,154 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             }
             world.getBlockAt(0,63,0).setType(Material.QUARTZ_BLOCK, false); built=true;
             rebuildViewerBlocks();
+            persistMapOptions(options);
+        }
+
+        private List<int[]> fixedTreeCenters() {
+            List<int[]> centers = new ArrayList<>();
+            for (int[] c : FIXED_TREE_CENTERS) {
+                // Defensive guard: the designed layout never collides with the
+                // protected zones, but skip instead of corrupting the arena if
+                // the constants drift.
+                if (treeSpotBlocked(c[0], c[1], !options.randomStands())) {
+                    getLogger().warning("固定障碍 (" + c[0] + "," + c[1] + ") 与保护区冲突，已跳过。");
+                    continue;
+                }
+                centers.add(c);
+            }
+            return centers;
+        }
+
+        private List<int[]> randomTreeCenters(Random random) {
+            List<int[]> centers = new ArrayList<>();
+            int perHalf = 3 + random.nextInt(3); // 3..5 per half, 6..10 total
+            boolean avoidStands = !options.randomStands();
+            for (int i = 0; i < perHalf; i++) {
+                for (int attempt = 0; attempt < 80; attempt++) {
+                    int x = 6 + random.nextInt(15);    // centre 6..20 from the centre line
+                    int z = -32 + random.nextInt(65);  // -32..32
+                    if (treeSpotBlocked(x, z, avoidStands)) continue;
+                    boolean clash = false;
+                    for (int[] c : centers) if (chebyshev(x, z, c[0], c[1]) < 5) { clash = true; break; }
+                    if (clash) continue;
+                    centers.add(new int[]{x, z});
+                    break;
+                }
+            }
+            return centers;
+        }
+
+        // A tree blocks its whole 3x3 footprint, so every footprint cell must
+        // stay out of the prison approach, spawn lanes and fixed stands.
+        private boolean treeSpotBlocked(int x, int z, boolean avoidStands) {
+            for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+                if (inPrisonKeepOut(x + dx, z + dz) || nearSpawnOrLobby(x + dx, z + dz, 0)) return true;
+                if (avoidStands && legacyStandNear(x + dx, z + dz, 2)) return true;
+            }
+            return false;
+        }
+
+        private Set<Long> placeTrees(List<int[]> centers) {
+            Set<Long> cells = new HashSet<>();
+            for (int[] center : centers) {
+                for (int sign = -1; sign <= 1; sign += 2) {
+                    for (int dx = -1; dx <= 1; dx++) for (int dz = -1; dz <= 1; dz++) {
+                        int x = center[0] * sign + dx, z = center[1] + dz;
+                        cells.add(cellKey(x, z));
+                        world.getBlockAt(x, 64, z).setType(Material.OAK_LOG, false);
+                        world.getBlockAt(x, 65, z).setType(Material.OAK_LOG, false);
+                        world.getBlockAt(x, 66, z).setType(Material.OAK_LEAVES, false);
+                        world.getBlockAt(x, 67, z).setType(Material.OAK_LEAVES, false);
+                    }
+                }
+            }
+            return cells;
+        }
+
+        private List<int[]> randomStandCells(Random random, Set<Long> treeCells, List<int[]> otherType,
+                                             int otherSpacing, boolean forTargets) {
+            int minDist = forTargets ? 3 : 9, maxDist = forTargets ? 8 : 22;
+            List<int[]> cells = new ArrayList<>();
+            for (int i = 0; i < FLAG_COUNT; i++) {
+                int[] cell = null;
+                for (int attempt = 0; attempt < 100 && cell == null; attempt++) {
+                    int x = minDist + random.nextInt(maxDist - minDist + 1);
+                    int z = -33 + random.nextInt(67);
+                    if (standCellBlocked(x, z, treeCells, cells, otherType, otherSpacing)) continue;
+                    cell = new int[]{x, z};
+                }
+                if (cell == null) cell = sweepStandCell(treeCells, cells, otherType, otherSpacing, minDist, maxDist);
+                cells.add(cell);
+            }
+            return cells;
+        }
+
+        private boolean standCellBlocked(int x, int z, Set<Long> treeCells, List<int[]> placed,
+                                         List<int[]> otherType, int otherSpacing) {
+            if (inPrisonKeepOut(x, z) || nearSpawnOrLobby(x, z, 0)) return true;
+            if (treeNear(x, z, treeCells, STAND_TREE_MARGIN)) return true;
+            for (int[] c : placed) if (chebyshev(x, z, c[0], c[1]) < FLAG_STAND_SPACING) return true;
+            for (int[] c : otherType) if (chebyshev(x, z, c[0], c[1]) < otherSpacing) return true;
+            return false;
+        }
+
+        private int[] sweepStandCell(Set<Long> treeCells, List<int[]> placed, List<int[]> otherType,
+                                     int otherSpacing, int minDist, int maxDist) {
+            for (int z = -33; z <= 33; z++) for (int x = minDist; x <= maxDist; x++)
+                if (!standCellBlocked(x, z, treeCells, placed, otherType, otherSpacing)) return new int[]{x, z};
+            return new int[]{minDist, 0};
+        }
+
+        private boolean treeNear(int x, int z, Set<Long> treeCells, int margin) {
+            for (int dx = -margin; dx <= margin; dx++) for (int dz = -margin; dz <= margin; dz++)
+                if (treeCells.contains(cellKey(x + dx, z + dz))) return true;
+            return false;
+        }
+
+        private List<int[]> legacyTargets() {
+            List<int[]> cells = new ArrayList<>();
+            for (int i = 0; i < FLAG_COUNT; i++) cells.add(new int[]{i < 4 ? 4 : 7, zs[i % 4]});
+            return cells;
+        }
+
+        private List<int[]> legacyFlags() {
+            List<int[]> cells = new ArrayList<>();
+            for (int i = 0; i < FLAG_COUNT; i++) cells.add(new int[]{i < 4 ? 18 : 10, zs[i % 4]});
+            return cells;
+        }
+
+        private boolean legacyStandNear(int distX, int z, int minDistance) {
+            for (int[] c : legacyFlags()) if (chebyshev(distX, z, c[0], c[1]) < minDistance) return true;
+            for (int[] c : legacyTargets()) if (chebyshev(distX, z, c[0], c[1]) < minDistance) return true;
+            return false;
+        }
+
+        // Zones in distance-from-centre space (|x|), mirrored across x=0.
+        private static boolean inPrisonKeepOut(int distX, int z) {
+            return distX >= 11 && distX <= 21 && z >= 21 && z <= 33;
+        }
+
+        private static boolean nearSpawnOrLobby(int distX, int z, int margin) {
+            return chebyshev(distX, z, 12, 0) <= 3 + margin || chebyshev(distX, z, 0, 0) <= 3 + margin;
+        }
+
+        private static int chebyshev(int x1, int z1, int x2, int z2) {
+            return Math.max(Math.abs(x1 - x2), Math.abs(z1 - z2));
+        }
+
+        private static long cellKey(int x, int z) {
+            return ((long) (x + 512) << 10) | (z + 512);
         }
 
         private void rebuildViewerBlocks() {
             viewerBlocks.clear();
             for (int x = -24; x <= 24; x++) for (int z = -36; z <= 36; z++) {
                 Material material = world.getBlockAt(x, 64, z).getType();
-                if (material == Material.STONE_BRICKS || material == Material.IRON_BARS || material == Material.WHITE_WOOL || material == Material.IRON_DOOR)
-                    viewerBlocks.add(Map.of("x", x, "z", z, "kind", material == Material.WHITE_WOOL ? "divider" : material == Material.IRON_DOOR ? "door" : material == Material.IRON_BARS ? "prison" : "wall"));
+                if (material == Material.STONE_BRICKS || material == Material.IRON_BARS || material == Material.WHITE_WOOL
+                        || material == Material.IRON_DOOR || material == Material.OAK_LOG)
+                    viewerBlocks.add(Map.of("x", x, "z", z, "kind", material == Material.WHITE_WOOL ? "divider"
+                            : material == Material.IRON_DOOR ? "door" : material == Material.OAK_LOG ? "tree"
+                            : material == Material.IRON_BARS ? "prison" : "wall"));
             }
         }
         void resetState(){

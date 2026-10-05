@@ -25,6 +25,7 @@ final class ViewerStateWriter implements AutoCloseable {
     private final AtomicBoolean writing = new AtomicBoolean();
     private final ExecutorService executor;
     private long lastWarning;
+    private int replaceRetries;
 
     ViewerStateWriter(Path destination, Logger logger) {
         this.destination = destination;
@@ -58,6 +59,8 @@ final class ViewerStateWriter implements AutoCloseable {
     private void flush() {
         Map<String, Object> snapshot = pending.getAndSet(null);
         if (snapshot == null) return;
+        long start = System.nanoTime();
+        replaceRetries = 0;
         Path temporary = destination.resolveSibling(destination.getFileName() + ".tmp");
         try {
             Files.writeString(temporary, gson.toJson(snapshot), StandardCharsets.UTF_8);
@@ -67,6 +70,12 @@ final class ViewerStateWriter implements AutoCloseable {
                 logger.warning("Viewer snapshot write failed: " + exception);
                 lastWarning = System.currentTimeMillis();
             }
+        } finally {
+            long ms = (System.nanoTime() - start) / 1_000_000L;
+            if (ms > 60) logger.warning("viewer-state write took " + ms + " ms"
+                    + ", replaceRetries=" + replaceRetries
+                    + ", snapshotAt=" + snapshot.get("updatedAt")
+                    + ", completedAt=" + System.currentTimeMillis());
         }
     }
 
@@ -81,6 +90,7 @@ final class ViewerStateWriter implements AutoCloseable {
                 return;
             } catch (FileSystemException exception) {
                 if (attempt >= 20) throw exception;
+                replaceRetries++;
                 try {
                     TimeUnit.MILLISECONDS.sleep(Math.min(100L, 10L * (attempt + 1)));
                 } catch (InterruptedException interrupted) {

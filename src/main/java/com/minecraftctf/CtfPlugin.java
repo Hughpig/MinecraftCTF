@@ -72,11 +72,16 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     private ExecutorService eventLogWriter;
     private ViewerStateWriter viewerWriter;
     private BukkitTask viewerTask;
+    private BukkitTask mapBuildTask;
     private Map<String, Object> viewerResult;
     private final Map<UUID, Team> viewerTeams = new LinkedHashMap<>();
     private final Map<String, String> viewerCapturedFlags = new LinkedHashMap<>();
     private final Deque<Map<String, Object>> viewerEvents = new ArrayDeque<>();
     private long viewerMapVersion;
+    private long viewerBlocksSentVersion = -1;
+    private boolean viewerBlocksSentBuilt;
+    private int viewerPublishCount;
+    private long lastPluginTickAt;
 
     @Override public void onEnable() {
         saveDefaultConfig();
@@ -95,16 +100,34 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         if (arenaWorld != null) {
             arenaWorld.setStorm(false); arenaWorld.setThundering(false); arenaWorld.setTime(6000);
             map = new ArenaMap(arenaWorld);
+            if (map.restoreExisting()) {
+                map.resetState();
+                viewerMapVersion = 1;
+            }
         }
-        tickTask = Bukkit.getScheduler().runTaskTimer(this, this::tick, 1L, 1L);
+        tickTask = Bukkit.getScheduler().runTaskTimer(this, () -> {
+            long start = System.nanoTime();
+            long gapMs = lastPluginTickAt == 0 ? 0 : (start - lastPluginTickAt) / 1_000_000L;
+            lastPluginTickAt = start;
+            if (gapMs > 150) getLogger().warning("plugin tick gap " + gapMs
+                    + " ms, observedAt=" + System.currentTimeMillis());
+            try {
+                tick();
+            } finally {
+                long ms = (System.nanoTime() - start) / 1_000_000L;
+                if (ms > 30) getLogger().warning("tick() took " + ms
+                        + " ms, completedAt=" + System.currentTimeMillis());
+            }
+        }, 1L, 1L);
         viewerWriter = new ViewerStateWriter(getDataFolder().toPath().resolve("viewer-state.json"), getLogger());
-        viewerTask = Bukkit.getScheduler().runTaskTimer(this, () -> publishViewerState(true), 1L, 4L);
+        viewerTask = Bukkit.getScheduler().runTaskTimer(this, () -> publishViewerState(true), 1L, 1L);
         getLogger().info("MinecraftCTF enabled. Use /ctf setup then /ctf join <left|right>.");
     }
 
     @Override public void onDisable() {
         if (tickTask != null) tickTask.cancel();
         if (viewerTask != null) viewerTask.cancel();
+        if (mapBuildTask != null) mapBuildTask.cancel();
         if (match != null) finish("server_shutdown");
         if (eventLogWriter != null) {
             eventLogWriter.shutdown();
@@ -116,16 +139,30 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
 
     void setupMap() {
         if (arenaWorld == null) return;
+        if (mapBuildTask != null) return;
         if (match != null) finish("map_reset");
-        map = new ArenaMap(arenaWorld);
-        map.build();
-        viewerMapVersion++;
-        viewerCapturedFlags.clear();
-        viewerResult = null;
-        viewerTeams.clear();
-        viewerTeams.putAll(lobby);
-        broadcast("固定地图已生成：世界 " + ARENA_WORLD + "，中央标记线 x=0，可通行。");
-        event("map_setup", Map.of("world", ARENA_WORLD, "mode", "fixed"));
+        if (map == null) map = new ArenaMap(arenaWorld);
+        if (map.built) {
+            map.resetState();
+            viewerMapVersion++;
+            viewerCapturedFlags.clear();
+            viewerResult = null;
+            viewerTeams.clear();
+            viewerTeams.putAll(lobby);
+            broadcast("固定地图已就绪：世界 " + ARENA_WORLD + "，中央标记线 x=0，可通行。");
+            event("map_setup", Map.of("world", ARENA_WORLD, "mode", "fixed", "reused", true));
+            return;
+        }
+        mapBuildTask = map.startBuild(() -> {
+            mapBuildTask = null;
+            viewerMapVersion++;
+            viewerCapturedFlags.clear();
+            viewerResult = null;
+            viewerTeams.clear();
+            viewerTeams.putAll(lobby);
+            broadcast("固定地图已生成：世界 " + ARENA_WORLD + "，中央标记线 x=0，可通行。");
+            event("map_setup", Map.of("world", ARENA_WORLD, "mode", "fixed"));
+        });
     }
 
     boolean join(Player player, Team team) {
@@ -148,7 +185,10 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     }
 
     boolean start() {
-        if (map == null || !map.built) setupMap();
+        if (map == null || !map.built) {
+            setupMap();
+            return false;
+        }
         if (requestedMapMode.equals("random")) broadcast("当前 MVP 尚未启用随机地图，本局使用 fixed 固定坐标。" );
         int required = requestedPlayers > 0 ? requestedPlayers : 1;
         boolean singleTeam = allowEmptyOpponent && teamCount(Team.RIGHT) == 0;
@@ -339,11 +379,6 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             match.prisonTeam.remove(id);
             match.jailedUntil.remove(id);
             if (player != null) {
-                // Put the released player on the safe side of the doorway. This avoids
-                // spawning several players inside the same door hitbox where physical
-                // pushing can leave a client oscillating at the prison wall.
-                Location exit = map.prisonDoor(team).clone().add(0, 0, -3.0);
-                player.teleport(exit);
                 player.sendMessage(Component.text("监狱门已打开，你已获释。"));
                 event("release", Map.of("player", player.getName(), "reason", reason));
             }
@@ -412,7 +447,18 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
                 : viewerResult != null ? Map.of("left", viewerResult.get("left"), "right", viewerResult.get("right"))
                 : Map.of("left", 0, "right", 0));
         state.put("result", viewerResult);
-        state.put("blocks", map != null ? List.copyOf(map.viewerBlocks) : List.of());
+        boolean built = map != null && map.built;
+        // The writer keeps only its newest pending state, so repeat static
+        // blocks once per second in case the first versioned state is dropped.
+        viewerPublishCount++;
+        boolean withBlocks = viewerMapVersion != viewerBlocksSentVersion
+                || built != viewerBlocksSentBuilt
+                || viewerPublishCount % 20 == 0;
+        if (withBlocks) {
+            viewerBlocksSentVersion = viewerMapVersion;
+            viewerBlocksSentBuilt = built;
+            state.put("blocks", map != null ? List.copyOf(map.viewerBlocks) : List.of());
+        }
         List<Map<String, Object>> flags = new ArrayList<>(), targets = new ArrayList<>(), players = new ArrayList<>();
         List<Map<String, Object>> prisons = new ArrayList<>();
         if (map != null && map.built) {
@@ -562,29 +608,81 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         final List<Map<String, Object>> viewerBlocks = new ArrayList<>();
         final int[] zs={-30,-22,-14,-6,6,14,22,30};
         ArenaMap(World world){this.world=world;}
-        void build(){
-            flags.clear(); targets.clear();
-            for(int x=-24;x<=24;x++) for(int z=-36;z<=36;z++) for(int y=64;y<=80;y++) world.getBlockAt(x,y,z).setType(Material.AIR);
-            for(int x=-24;x<=24;x++) for(int z=-36;z<=36;z++){ world.getBlockAt(x,62,z).setType(Material.STONE); world.getBlockAt(x,63,z).setType(Material.GRASS_BLOCK); }
-            for(int x=-24;x<=24;x++) for(int y=64;y<=68;y++){ world.getBlockAt(x,y,-36).setType(Material.STONE_BRICKS); world.getBlockAt(x,y,36).setType(Material.STONE_BRICKS); }
-            for(int z=-36;z<=36;z++) for(int y=64;y<=68;y++){ world.getBlockAt(-24,y,z).setType(Material.STONE_BRICKS); world.getBlockAt(24,y,z).setType(Material.STONE_BRICKS); }
-            for(int z=-36;z<=36;z++) world.getBlockAt(0,63,z).setType(Material.RED_CONCRETE);
+        boolean restoreExisting() {
+            if (world.getBlockAt(0, 63, 0).getType() != Material.QUARTZ_BLOCK) return false;
+            flags.clear(); targets.clear(); viewerBlocks.clear();
+            for (Team t : Team.values()) {
+                int sign = t == Team.LEFT ? -1 : 1;
+                Material wool = t == Team.LEFT ? Material.RED_BANNER : Material.BLUE_BANNER;
+                int x1 = sign * 18, x2 = sign * 10;
+                for (int i = 0; i < 8; i++) {
+                    int x = i < 4 ? x1 : x2, z = zs[i % 4];
+                    Location fl = new Location(world, x, 64, z);
+                    flags.put(t.id + "-flag-" + (i + 1), new Flag(t.id + "-flag-" + (i + 1), t, fl, wool, CtfPlugin.this));
+                    int gx = sign * (i < 4 ? 4 : 7);
+                    Location gl = new Location(world, gx, 63, z);
+                    targets.put(t.id + "-goal-" + (i + 1), new Target(t.id + "-goal-" + (i + 1), t, gl, CtfPlugin.this));
+                }
+                // Also repair reused maps that had a wider prison entrance.
+                buildPrison(t);
+            }
+            rebuildViewerBlocks();
+            built = true;
+            return true;
+        }
+        BukkitTask startBuild(Runnable complete) {
+            flags.clear(); targets.clear(); viewerBlocks.clear(); built = false;
+            // The arena only occupies y=62..68. Clearing the unused air above
+            // it multiplied setup work by more than three without changing the
+            // resulting map.
+            final int clearHeight = 68 - 64 + 1;
+            final int total = (24 - (-24) + 1) * (36 - (-36) + 1) * clearHeight;
+            final int[] cursor = {0};
+            final BukkitTask[] task = new BukkitTask[1];
+            task[0] = Bukkit.getScheduler().runTaskTimer(CtfPlugin.this, () -> {
+                // Clearing the old arena is the expensive part of setup. Spread it
+                // over ticks so viewers and connected bots keep receiving updates.
+                int budget = 700;
+                while (budget-- > 0 && cursor[0] < total) {
+                    int value = cursor[0]++;
+                    int x = -24 + value / (73 * clearHeight);
+                    int z = -36 + (value / clearHeight) % 73;
+                    int y = 64 + value % clearHeight;
+                    world.getBlockAt(x, y, z).setType(Material.AIR, false);
+                }
+                if (cursor[0] < total) return;
+                task[0].cancel();
+                finishBuild();
+                complete.run();
+                if (lobby.size() >= 1 && ready.values().stream().filter(Boolean::booleanValue).count() == lobby.size()
+                        && teamCount(Team.LEFT) > 0 && (allowEmptyOpponent || teamCount(Team.RIGHT) > 0)) start();
+            }, 1L, 1L);
+            return task[0];
+        }
+
+        private void finishBuild() {
+            for(int x=-24;x<=24;x++) for(int z=-36;z<=36;z++){ world.getBlockAt(x,62,z).setType(Material.STONE, false); world.getBlockAt(x,63,z).setType(Material.GRASS_BLOCK, false); }
+            for(int x=-24;x<=24;x++) for(int y=64;y<=68;y++){ world.getBlockAt(x,y,-36).setType(Material.STONE_BRICKS, false); world.getBlockAt(x,y,36).setType(Material.STONE_BRICKS, false); }
+            for(int z=-36;z<=36;z++) for(int y=64;y<=68;y++){ world.getBlockAt(-24,y,z).setType(Material.STONE_BRICKS, false); world.getBlockAt(24,y,z).setType(Material.STONE_BRICKS, false); }
+            for(int z=-36;z<=36;z++) world.getBlockAt(0,63,z).setType(Material.RED_CONCRETE, false);
             for(Team t:Team.values()){
                 int sign=t==Team.LEFT?-1:1; Material wool=t==Team.LEFT?Material.RED_BANNER:Material.BLUE_BANNER; int x1=sign*18, x2=sign*10;
                 for(int i=0;i<8;i++){
                     int x=i<4?x1:x2, z=zs[i%4];
-                    Location fl=new Location(world,x,64,z); fl.getBlock().setType(wool); world.getBlockAt(x,65,z).setType(Material.AIR);
+                    Location fl=new Location(world,x,64,z); fl.getBlock().setType(wool, false); world.getBlockAt(x,65,z).setType(Material.AIR, false);
                     flags.put(t.id+"-flag-"+(i+1),new Flag(t.id+"-flag-"+(i+1),t,fl,wool,CtfPlugin.this));
-                    int gx=sign* (i<4?4:7); Location gl=new Location(world,gx,63,z); gl.getBlock().setType(Material.GOLD_BLOCK); targets.put(t.id+"-goal-"+(i+1),new Target(t.id+"-goal-"+(i+1),t,gl,CtfPlugin.this));
+                    int gx=sign* (i<4?4:7); Location gl=new Location(world,gx,63,z); gl.getBlock().setType(Material.GOLD_BLOCK, false); targets.put(t.id+"-goal-"+(i+1),new Target(t.id+"-goal-"+(i+1),t,gl,CtfPlugin.this));
                 }
                 buildPrison(t);
-                // Keep the prison-side team marker distinct from banner flags so
-                // clients scanning banner blocks do not mistake it for a flag.
                 Material teamMarker = t == Team.LEFT ? Material.RED_WOOL : Material.BLUE_WOOL;
-                world.getBlockAt(sign*22,63,0).setType(teamMarker);
-                world.getBlockAt(sign*22,64,0).setType(Material.AIR);
+                world.getBlockAt(sign*22,63,0).setType(teamMarker, false);
+                world.getBlockAt(sign*22,64,0).setType(Material.AIR, false);
             }
-            world.getBlockAt(0,63,0).setType(Material.QUARTZ_BLOCK); built=true;
+            world.getBlockAt(0,63,0).setType(Material.QUARTZ_BLOCK, false); built=true;
+            rebuildViewerBlocks();
+        }
+
+        private void rebuildViewerBlocks() {
             viewerBlocks.clear();
             for (int x = -24; x <= 24; x++) for (int z = -36; z <= 36; z++) {
                 Material material = world.getBlockAt(x, 64, z).getType();
@@ -593,6 +691,14 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             }
         }
         void resetState(){
+            // Dropped flags can outlive a match (or a server restart). Clear all
+            // team banners before restoring origins so bots cannot chase stale flags.
+            for (int x = -23; x <= 23; x++) for (int z = -35; z <= 35; z++) {
+                Block block = world.getBlockAt(x, 64, z);
+                Material material = block.getType();
+                if (material == Material.RED_BANNER || material == Material.BLUE_BANNER)
+                    block.setType(Material.AIR, false);
+            }
             for(Flag f:flags.values()){ f.location=f.origin.clone(); f.setVisible(true); }
             for(Target g:targets.values()) g.setLocked(false);
             for(Team team:Team.values()) setPrisonDoor(team, true);
@@ -602,31 +708,26 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             int centerX = center.getBlockX(), centerZ = center.getBlockZ();
             for (int x = centerX - 2; x <= centerX + 2; x++) for (int z = centerZ - 2; z <= centerZ + 2; z++) {
                 if (x != centerX - 2 && x != centerX + 2 && z != centerZ - 2 && z != centerZ + 2) continue;
-                for (int y = 64; y <= 67; y++) world.getBlockAt(x, y, z).setType(Material.IRON_BARS);
+                for (int y = 64; y <= 67; y++) world.getBlockAt(x, y, z).setType(Material.IRON_BARS, false);
             }
             Location entrance = prisonDoor(team);
-            // A one-block doorway is easy to catch on when players are pushed by
-            // collision. Keep the visual iron door, but make the entrance three
-            // blocks wide so both players and bots can leave smoothly.
-            for (int x = entrance.getBlockX() - 1; x <= entrance.getBlockX() + 1; x++) {
-                for (int y = 64; y <= 67; y++) world.getBlockAt(x, y, entrance.getBlockZ()).setType(Material.AIR);
-                for (Bisected.Half half : Bisected.Half.values()) {
-                    Door door = (Door) Bukkit.createBlockData(Material.IRON_DOOR);
-                    door.setFacing(BlockFace.NORTH); door.setHalf(half); door.setOpen(false);
-                    world.getBlockAt(x, half == Bisected.Half.BOTTOM ? 64 : 65, entrance.getBlockZ()).setBlockData(door, false);
-                }
+            // Only the cell facing the pressure plate is a doorway. Keep the
+            // surrounding bars, including those above the two-block door.
+            for (Bisected.Half half : Bisected.Half.values()) {
+                Door door = (Door) Bukkit.createBlockData(Material.IRON_DOOR);
+                door.setFacing(BlockFace.NORTH); door.setHalf(half); door.setOpen(false);
+                world.getBlockAt(entrance.getBlockX(), half == Bisected.Half.BOTTOM ? 64 : 65,
+                        entrance.getBlockZ()).setBlockData(door, false);
             }
-            prisonPlate(team).getBlock().setType(Material.STONE_PRESSURE_PLATE);
+            prisonPlate(team).getBlock().setType(Material.STONE_PRESSURE_PLATE, false);
         }
         void setPrisonDoor(Team team, boolean open) {
             Location entrance = prisonDoor(team);
-            for (int x = entrance.getBlockX() - 1; x <= entrance.getBlockX() + 1; x++) {
-                for (int y = 64; y <= 65; y++) {
-                    Block block = world.getBlockAt(x, y, entrance.getBlockZ());
-                    if (!(block.getBlockData() instanceof Door door)) continue;
-                    door.setOpen(open);
-                    block.setBlockData(door, false);
-                }
+            for (int y = 64; y <= 65; y++) {
+                Block block = world.getBlockAt(entrance.getBlockX(), y, entrance.getBlockZ());
+                if (!(block.getBlockData() instanceof Door door)) continue;
+                door.setOpen(open);
+                block.setBlockData(door, false);
             }
         }
         void dropFlagNear(Flag flag, Location near){

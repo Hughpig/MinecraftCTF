@@ -14,7 +14,7 @@ public final class CtfCommand implements CommandExecutor, TabCompleter {
     @Override public boolean onCommand(CommandSender sender, Command command, String label, String[] args){
         String sub=args.length==0?"status":args[0].toLowerCase();
         switch(sub){
-            case "setup" -> { plugin.setupMap(); sender.sendMessage("固定地图已生成。"); }
+            case "setup" -> { plugin.setupMap(); sender.sendMessage("固定地图 setup 请求已处理，完成状态见聊天。"); }
             case "join" -> { if(!(sender instanceof Player p)){sender.sendMessage("仅玩家可加入。");return true;} if(args.length<2 || (!args[1].equalsIgnoreCase("left")&&!args[1].equalsIgnoreCase("right"))){sender.sendMessage("用法: /ctf join left|right");return true;} plugin.join(p,args[1].equalsIgnoreCase("left")?CtfPlugin.Team.LEFT:CtfPlugin.Team.RIGHT); }
             case "ready" -> { if(sender instanceof Player p) plugin.ready(p); }
             case "start" -> plugin.start();

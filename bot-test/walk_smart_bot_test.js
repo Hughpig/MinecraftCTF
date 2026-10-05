@@ -10,9 +10,9 @@ const BOT_COUNT = Math.max(1, Math.min(16, Number(process.env.CTF_BOTS || 6)));
 const PLAYERS_PER_TEAM = Math.max(1, Math.min(16, Number(process.env.CTF_PLAYERS || 3)));
 const ACTIVE_TEAM = process.env.CTF_ACTIVE_TEAM || 'both';
 const VIEW_DISTANCE = Number(process.env.CTF_BOT_VIEW_DISTANCE ?? 3);
-const JOIN_DELAY_MS = Number(process.env.CTF_BOT_JOIN_DELAY_MS ?? 400);
+const LOGIN_STAGGER_MS = Number(process.env.CTF_BOT_LOGIN_STAGGER_MS ?? 250);
 if (!Number.isInteger(VIEW_DISTANCE) || VIEW_DISTANCE < 2 || VIEW_DISTANCE > 32) throw new Error('CTF_BOT_VIEW_DISTANCE must be an integer between 2 and 32');
-if (!Number.isFinite(JOIN_DELAY_MS) || JOIN_DELAY_MS < 0 || JOIN_DELAY_MS > 5000) throw new Error('CTF_BOT_JOIN_DELAY_MS must be between 0 and 5000');
+if (!Number.isFinite(LOGIN_STAGGER_MS) || LOGIN_STAGGER_MS < 0 || LOGIN_STAGGER_MS > 5000) throw new Error('CTF_BOT_LOGIN_STAGGER_MS must be between 0 and 5000');
 const MATCH = `match team:local-bots enemy:bot players:${PLAYERS_PER_TEAM} map:fixed`;
 const FLAG_APPROACH_OFFSET = 1.25;
 const bots = [];
@@ -408,18 +408,27 @@ let testTimeout = setTimeout(() => { log('smoke', 'startup deadline exceeded'); 
 async function startBots() {
   // Three chunks cover the route's flags from the prison exit. Two can leave
   // the far banners unloaded when a released bot scans for its next target.
+  // Logins only need a small stagger: Paper paces chunk sends per player, so
+  // the terrain waits run in parallel instead of one bot gating the next.
+  const terrainReady = [];
   for (let i = 0; i < BOT_COUNT && !stopping; i++) {
     const bot = makeBot(i);
-    await waitForInitialWorld(bot, { isStopping: () => stopping });
-    if (stopping) return;
-    log(bot.username, 'startup terrain loaded');
+    terrainReady.push(
+      waitForInitialWorld(bot, { isStopping: () => stopping })
+        .then(() => log(bot.username, 'startup terrain loaded'))
+    );
     if (i === 0) {
-      bot.chat('/ctf setup');
-      await mapReady;
+      // The map is restored from the built arena at plugin enable, so setup
+      // only needs a spawned player, not fully streamed terrain.
+      bot.once('spawn', () => { if (!stopping) bot.chat('/ctf setup'); });
     }
-    if (i + 1 < BOT_COUNT) await sleep(JOIN_DELAY_MS);
+    if (i + 1 < BOT_COUNT) await sleep(LOGIN_STAGGER_MS);
   }
-  // Let Paper finish the last login before match preparation/teleports begin.
+  if (stopping) return;
+  await Promise.all(terrainReady);
+  if (stopping) return;
+  await mapReady;
+  // Let Paper settle the last login before match preparation/teleports begin.
   await sleep(2000);
   for (const bot of bots) {
     if (stopping) return;

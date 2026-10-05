@@ -180,27 +180,45 @@ async function waitFor(bot, predicate, description) {
   if (!stopping && !predicate()) throw new Error(`server did not confirm ${description}`);
 }
 
-function findEnemyFlag(bot, preferredX, preferredZ, homeSign) {
+function scanEnemyBanners(bot) {
   const blockName = bot.ctf.team === 'left' ? 'blue_banner' : 'red_banner';
   const block = bot.registry.blocksByName[blockName];
   if (!block || !bot.entity) return null;
-  const positions = findArenaFlags(bot, block.id);
-  if (positions.length === 0) return null;
-  positions.sort((a, b) => {
+  const now = Date.now();
+  if (bot.ctf.flagScan && now - bot.ctf.flagScan.at < 700) return bot.ctf.flagScan.positions;
+  bot.ctf.flagScan = { at: now, positions: findArenaFlags(bot, block.id) };
+  return bot.ctf.flagScan.positions;
+}
+
+function isBannerGone(bot, position) {
+  const positions = scanEnemyBanners(bot);
+  if (!positions) return false;
+  return !positions.some(p => Math.abs(p.x - position.x) < 0.6 && Math.abs(p.z - position.z) < 0.6);
+}
+
+function findEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt = 0) {
+  const positions = scanEnemyBanners(bot);
+  if (!positions || positions.length === 0) return null;
+  const sorted = [...positions].sort((a, b) => {
     const aPreferred = Math.hypot(a.x - preferredX, a.z - preferredZ);
     const bPreferred = Math.hypot(b.x - preferredX, b.z - preferredZ);
     const aDistance = a.distanceSquared(bot.entity.position);
     const bDistance = b.distanceSquared(bot.entity.position);
     return (aPreferred < 1 ? -10000 : aDistance) - (bPreferred < 1 ? -10000 : bDistance);
   });
-  const position = positions[0];
-  return { x: position.x + homeSign * FLAG_APPROACH_OFFSET, z: position.z + 0.3 };
+  // Rotate through the nearest few banners on retries: when a teammate grabs
+  // the same nearest flag, the loser moves to the next one instead of racing
+  // for the same spot again.
+  const position = sorted[attempt % Math.min(sorted.length, 4)];
+  // x/z is the approach point (offset toward home); bx/bz is the banner cell
+  // itself, which is what "the flag is gone" checks must compare against.
+  return { x: position.x + homeSign * FLAG_APPROACH_OFFSET, z: position.z + 0.3, bx: position.x, bz: position.z };
 }
 
-async function waitForEnemyFlag(bot, preferredX, preferredZ, homeSign) {
+async function waitForEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt = 0) {
   const started = Date.now();
   while (!stopping && Date.now() - started < 5000) {
-    const flag = findEnemyFlag(bot, preferredX, preferredZ, homeSign);
+    const flag = findEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt);
     if (flag) return flag;
     await sleep(100);
   }
@@ -269,11 +287,15 @@ async function runRoute(bot) {
         await leavePrison(bot);
         // Always locate the live banner: random stands and dropped flags both
         // move it away from the fixed-map origins.
-        flag = await waitForEnemyFlag(bot, flagX, z, homeSign);
+        flag = await waitForEnemyFlag(bot, flagX, z, homeSign, attempts - 1);
         log(bot.username, `go flag ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
         await goNear(bot, homeSign * 2, bot.entity.position.z);
         await goNear(bot, homeSign * 2, flag.z);
-        await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying);
+        // If a teammate grabs this banner first it vanishes from the world —
+        // bail out immediately and let the retry pick the next nearest flag.
+        const flagTarget = { x: flag.bx, z: flag.bz };
+        await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying || isBannerGone(bot, flagTarget));
+        if (!bot.ctf.carrying && isBannerGone(bot, flagTarget)) throw new Error('flag was taken by a teammate');
         await waitFor(bot, () => bot.ctf.carrying, `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
         if (stopping) break;
         log(bot.username, `go goal ${goalX},${z}`);

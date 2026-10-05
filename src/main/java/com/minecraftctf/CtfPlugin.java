@@ -238,6 +238,9 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         viewerTeams.put(player.getUniqueId(), team); viewerResult = null;
         player.sendMessage(Component.text("已加入 " + team.label + " 队。当前人数 " + lobby.size() + "，每队上限 " + MAX_TEAM_SIZE + "。"));
         event("lobby_join", Map.of("player", player.getName(), "team", team.id));
+        // Pinned-side clients join via /ctf join before their match message, so
+        // the ready prompt must fire on joins too, not only on match messages.
+        maybePromptReady();
         return true;
     }
 

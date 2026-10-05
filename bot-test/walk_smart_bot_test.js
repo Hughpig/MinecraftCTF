@@ -2,6 +2,7 @@ const mineflayer = require('mineflayer');
 const { Vec3 } = require('vec3');
 const loopDiagnostics = require('./loop-diagnostics')();
 const findArenaFlags = require('./arena-flag-search');
+const findArenaGoals = require('./arena-goal-search');
 const waitForInitialWorld = require('./startup-world');
 const { planSteer, strafeSideForAway, makeBlockProbe, nearestFreeCell } = require('./ctf-steer');
 
@@ -293,6 +294,25 @@ async function waitForEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt =
   throw new Error('cannot find an available enemy flag');
 }
 
+function isGoalLocked(bot, goal) {
+  return bot.world.getBlockType(new Vec3(goal.x, 64, goal.z)) !== 0;
+}
+
+// Nearest unlocked home goal. Random stand layouts put goals anywhere, so
+// hardcoding the legacy rows made carriers circle around empty coordinates.
+async function waitForHomeGoal(bot) {
+  const started = Date.now();
+  while (!stopping && Date.now() - started < 5000) {
+    const goals = findArenaGoals(bot);
+    if (goals.length > 0 && bot.entity) {
+      goals.sort((a, b) => a.distanceSquared(bot.entity.position) - b.distanceSquared(bot.entity.position));
+      return goals[0];
+    }
+    await sleep(100);
+  }
+  throw new Error('cannot find an unlocked home goal');
+}
+
 async function waitForRelease(bot) {
   const started = Date.now();
   while (!stopping && bot.ctf.jailed && Date.now() - started < 35000) await sleep(100);
@@ -419,7 +439,6 @@ async function runAttackerRoute(bot) {
     const flagIndex = routeIndex < 4 ? routeIndex + 4 : routeIndex - 4;
     const z = zs[routeIndex % 4];
     const flagX = -homeSign * (flagIndex < 4 ? 18 : 10);
-    const goalX = homeSign * (routeIndex < 4 ? 4 : 7);
     let captured = false;
     let attempts = 0;
     while (!stopping && !captured && attempts < 4) {
@@ -449,9 +468,12 @@ async function runAttackerRoute(bot) {
         if (!bot.ctf.carrying && isBannerGone(bot, flagTarget)) throw new Error('flag was taken by a teammate');
         await waitFor(bot, () => bot.ctf.carrying, `pickup near ${flag.x.toFixed(1)},${flag.z.toFixed(1)}`);
         if (stopping) break;
-        log(bot.username, `go goal ${goalX},${z}`);
+        const goal = await waitForHomeGoal(bot);
+        log(bot.username, `go goal ${goal.x},${goal.z}`);
         const previousCaptures = bot.ctf.captures;
-        await goNear(bot, goalX + 0.3, z + 0.3, () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying);
+        const goalTarget = { x: goal.x, z: goal.z };
+        await goNear(bot, goal.x + homeSign * 0.3, goal.z + 0.3,
+          () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying || isGoalLocked(bot, goalTarget));
         captured = bot.ctf.captures > previousCaptures;
         if (!captured && !stopping) log(bot.username, 'flag lost after capture; retrying after release');
       } catch (err) {
@@ -461,7 +483,8 @@ async function runAttackerRoute(bot) {
         // half before trying the live flag scan again.
         if (bot.ctf.carrying) {
           try {
-            await goNear(bot, goalX + 0.3, z + 0.3, () => !bot.ctf.carrying, { maxDuration: 10000 });
+            const goal = await waitForHomeGoal(bot);
+            await goNear(bot, goal.x + homeSign * 0.3, goal.z + 0.3, () => !bot.ctf.carrying, { maxDuration: 10000 });
           } catch (_) { bot.clearControlStates(); }
         }
         log(bot.username, `route step ${attempts}/4 skipped; retrying live flag: ${err.message}`);

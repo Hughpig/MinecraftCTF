@@ -12,6 +12,7 @@ import org.bukkit.WorldCreator;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.data.Bisected;
+import org.bukkit.block.data.MultipleFacing;
 import org.bukkit.block.data.type.Door;
 import org.bukkit.enchantments.Enchantment;
 import org.bukkit.entity.Player;
@@ -706,20 +707,42 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         void buildPrison(Team team) {
             Location center = prison(team);
             int centerX = center.getBlockX(), centerZ = center.getBlockZ();
-            for (int x = centerX - 2; x <= centerX + 2; x++) for (int z = centerZ - 2; z <= centerZ + 2; z++) {
-                if (x != centerX - 2 && x != centerX + 2 && z != centerZ - 2 && z != centerZ + 2) continue;
-                for (int y = 64; y <= 67; y++) world.getBlockAt(x, y, z).setType(Material.IRON_BARS, false);
-            }
+            int minX = centerX - 2, maxX = centerX + 2, minZ = centerZ - 2, maxZ = centerZ + 2;
             Location entrance = prisonDoor(team);
+            int doorX = entrance.getBlockX(), doorZ = entrance.getBlockZ();
+            for (int x = minX; x <= maxX; x++) for (int z = minZ; z <= maxZ; z++) {
+                if (x != minX && x != maxX && z != minZ && z != maxZ) continue;
+                boolean doorCell = x == doorX && z == doorZ;
+                for (int y = 64; y <= 67; y++) {
+                    if (doorCell && y <= 65) continue;
+                    Block block = world.getBlockAt(x, y, z);
+                    block.setType(Material.IRON_BARS, false);
+                    // setType leaves every bar a bare center post, so players
+                    // could slip between the cells of the ring. Arms toward
+                    // neighbouring ring cells make the wall solid; the doorway
+                    // stays the only opening.
+                    if (block.getBlockData() instanceof MultipleFacing bars) {
+                        bars.setFace(BlockFace.NORTH, isRingCell(minX, maxX, minZ, maxZ, x, z - 1));
+                        bars.setFace(BlockFace.SOUTH, isRingCell(minX, maxX, minZ, maxZ, x, z + 1));
+                        bars.setFace(BlockFace.WEST, isRingCell(minX, maxX, minZ, maxZ, x - 1, z));
+                        bars.setFace(BlockFace.EAST, isRingCell(minX, maxX, minZ, maxZ, x + 1, z));
+                        block.setBlockData(bars, false);
+                    }
+                }
+            }
             // Only the cell facing the pressure plate is a doorway. Keep the
             // surrounding bars, including those above the two-block door.
             for (Bisected.Half half : Bisected.Half.values()) {
                 Door door = (Door) Bukkit.createBlockData(Material.IRON_DOOR);
                 door.setFacing(BlockFace.NORTH); door.setHalf(half); door.setOpen(false);
-                world.getBlockAt(entrance.getBlockX(), half == Bisected.Half.BOTTOM ? 64 : 65,
-                        entrance.getBlockZ()).setBlockData(door, false);
+                world.getBlockAt(doorX, half == Bisected.Half.BOTTOM ? 64 : 65,
+                        doorZ).setBlockData(door, false);
             }
             prisonPlate(team).getBlock().setType(Material.STONE_PRESSURE_PLATE, false);
+        }
+        private boolean isRingCell(int minX, int maxX, int minZ, int maxZ, int x, int z) {
+            if (x < minX || x > maxX || z < minZ || z > maxZ) return false;
+            return x == minX || x == maxX || z == minZ || z == maxZ;
         }
         void setPrisonDoor(Team team, boolean open) {
             Location entrance = prisonDoor(team);

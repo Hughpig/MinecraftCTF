@@ -96,15 +96,26 @@ function prisonDoorFor(bot) {
   return bot.ctf.team === 'left' ? { x: -16, z: 26 } : { x: 16, z: 26 };
 }
 
+// The prison cell interior (z 26..31, |x| 12..20). The plate (z=24.5) and the
+// release point (z=23.5) are outside — knowing this keeps the rescuer from
+// re-walking the doorway and makes "already freed" detectable by position.
+function isInPrisonCell(position) {
+  return !!position && position.z >= 26 && position.z <= 31
+    && Math.abs(position.x) >= 12 && Math.abs(position.x) <= 20;
+}
+
 function maybeClaimRescue(bot) {
   if (bot.ctf.carrying || bot.ctf.jailed || bot.ctf.rescueTarget) return false;
   const c = teamCoordination[bot.ctf.team];
   if (!c || c.jailed.size === 0) return false;
-  // The prisoner's entity stays visible inside the prison, so visibility
-  // cannot clear an entry; only the rescuer's door-open check or the 30s
-  // timer can. Drop entries past the timer window.
+  // A door can be re-closed by a newer jail, so door state cannot prove
+  // anything. If the teammate's entity is visible outside the cell they are
+  // free; entries older than the 30s timer window are stale regardless.
   for (const [name, at] of c.jailed) {
-    if (Date.now() - at > JAIL_ENTRY_TIMEOUT_MS) c.jailed.delete(name);
+    const ent = entityByUsername(bot, name);
+    if ((ent && !isInPrisonCell(ent.position)) || Date.now() - at > JAIL_ENTRY_TIMEOUT_MS) {
+      c.jailed.delete(name);
+    }
   }
   for (const jailed of c.jailed.keys()) {
     if (c.rescuers.has(jailed)) continue;
@@ -119,17 +130,20 @@ async function rescueTeammate(bot) {
   const c = teamCoordination[bot.ctf.team];
   const target = bot.ctf.rescueTarget;
   const plate = prisonPlateFor(bot);
-  const door = prisonDoorFor(bot);
   log(bot.username, `rescuing ${target}: heading for the release plate`);
   try {
-    await goNear(bot, plate.x, plate.z, () => !c.jailed.has(target) || bot.ctf.jailed, { maxDuration: 25000 });
-    // Stand on the plate until the door actually opens (rescue or the 30s
-    // timer) — the plugin teleports the prisoner outside either way.
+    await goNear(bot, plate.x, plate.z, () => {
+      const ent = entityByUsername(bot, target);
+      return (!!ent && !isInPrisonCell(ent.position)) || bot.ctf.jailed;
+    }, { maxDuration: 25000 });
+    // Stand on the plate until the teammate actually walks out of the cell
+    // (rescue or the 30s timer) — the plugin teleports them outside either
+    // way. Entity position, not door state, is the source of truth here: a
+    // newer jail re-closes the door while this rescue is still polling.
     const deadline = Date.now() + 15000;
     while (!stopping && !bot.ctf.jailed && Date.now() < deadline) {
-      const doorBlock = bot.blockAt(new Vec3(door.x, 64, door.z));
-      const open = doorBlock && doorBlock.properties && doorBlock.properties.open;
-      if (open) { c.jailed.delete(target); break; }
+      const ent = entityByUsername(bot, target);
+      if (ent && !isInPrisonCell(ent.position)) { c.jailed.delete(target); break; }
       await sleep(200);
     }
     log(bot.username, `rescue finished for ${target}`);
@@ -404,9 +418,18 @@ async function waitForEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt =
 
 async function waitForEnemyBanner(bot) {
   const started = Date.now();
-  while (!stopping && Date.now() - started < 10000) {
+  let walked = false;
+  while (!stopping && Date.now() - started < 15000) {
     const positions = scanEnemyBanners(bot);
     if (positions && positions.length > 0) return positions;
+    // Late in a match the surviving banners can sit beyond the loaded chunks
+    // (view distance 3). Standing at the prison door polling is capture bait;
+    // walk toward the enemy half until one scrolls into view.
+    if (!walked && bot.entity) {
+      walked = true;
+      await goNear(bot, -homeSign(bot) * 6, bot.entity.position.z,
+        () => { const p = scanEnemyBanners(bot); return !!p && p.length > 0; }, { maxDuration: 7000 });
+    }
     await sleep(150);
   }
   throw new Error('no enemy banner available');
@@ -448,7 +471,7 @@ async function waitForRelease(bot) {
 
 async function leavePrison(bot) {
   if (!bot.entity) return;
-  const inside = bot.entity.position.z >= 24 && bot.entity.position.z <= 32
+  const inside = bot.entity.position.z >= 26 && bot.entity.position.z <= 31
     && Math.abs(bot.entity.position.x) >= 12 && Math.abs(bot.entity.position.x) <= 20;
   if (!inside) return;
   const doorX = bot.ctf.team === 'left' ? -15.5 : 16.5;

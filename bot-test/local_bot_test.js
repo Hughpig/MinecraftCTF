@@ -218,9 +218,18 @@ function findEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt = 0) {
 
 async function waitForEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt = 0) {
   const started = Date.now();
-  while (!stopping && Date.now() - started < 5000) {
+  let walked = false;
+  while (!stopping && Date.now() - started < 15000) {
     const flag = findEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt);
     if (flag) return flag;
+    // Late in a match the surviving banners can sit beyond the loaded chunks
+    // (view distance 3). Standing at the prison door polling is capture bait;
+    // walk toward the enemy half until one scrolls into view.
+    if (!walked && bot.entity) {
+      walked = true;
+      await goNear(bot, -homeSign * 6, bot.entity.position.z,
+        () => { const p = scanEnemyBanners(bot); return !!p && p.length > 0; }, { maxDuration: 7000 });
+    }
     await sleep(100);
   }
   throw new Error('cannot find an available enemy flag');
@@ -262,7 +271,7 @@ async function waitForRelease(bot) {
 
 async function leavePrison(bot) {
   if (!bot.entity) return;
-  const inside = bot.entity.position.z >= 24 && bot.entity.position.z <= 32
+  const inside = bot.entity.position.z >= 26 && bot.entity.position.z <= 31
     && Math.abs(bot.entity.position.x) >= 12 && Math.abs(bot.entity.position.x) <= 20;
   if (!inside) return;
   const doorX = bot.ctf.team === 'left' ? -15.5 : 16.5;

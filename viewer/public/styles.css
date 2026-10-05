@@ -85,6 +85,16 @@ h1 span { color: var(--red); }
 .primary-button { width: 100%; border: 0; border-radius: 7px; background: #2c3c53; color: white; padding: 10px 14px; margin-top: 16px; font-size: 12px; display: flex; align-items: center; justify-content: center; gap: 8px; }
 .primary-button:hover:not(:disabled) { background: #3b506c; }
 .demo-status { margin-top: 9px; font-size: 10px !important; overflow-wrap: anywhere; }
+.launch-grid { display: grid; gap: 8px; margin-top: 12px; }
+.launch-field, .launch-team { display: flex; flex-direction: column; gap: 5px; font-size: 10px; color: #7c8797; }
+.launch-field select, .launch-team input, .launch-team select { border: 1px solid var(--line); border-radius: 6px; padding: 5px 7px; font-size: 11px; width: 100%; background: white; color: inherit; }
+.launch-team { border: 1px solid var(--line); border-radius: 8px; padding: 8px 8px 9px; }
+.launch-team legend { font-size: 10px; color: #8c99aa; padding: 0 4px; }
+.launch-team label { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.launch-buttons { display: flex; gap: 8px; margin-top: 14px; }
+.launch-buttons .primary-button { flex: 1; margin-top: 0; }
+.ghost-button { border: 1px solid var(--line); border-radius: 7px; background: white; color: #5c6675; padding: 10px 12px; font-size: 12px; }
+.ghost-button:hover:not(:disabled) { background: #f2f4f7; }
 .count-tag { font-size: 10px; color: #8c99aa; background: #f2f4f7; padding: 2px 7px; border-radius: 4px; }
 .live-label { font-size: 9px; letter-spacing: 1px; color: #8b9caa; }
 .player-list { margin-top: 15px; }

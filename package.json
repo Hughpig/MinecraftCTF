@@ -6,6 +6,7 @@
   "main": "ctf_bot.js",
   "scripts": {
     "bot": "node ctf_bot.js",
+    "launch": "node scripts/launch-match.js",
     "walk": "node scripts/run-local-bots.js",
     "local-3v3": "node scripts/run-local-bots.js",
     "walk-smart": "node scripts/run-walk-smart.js",

@@ -34,7 +34,27 @@
         <div class="arena-caption"><span>固定地图 · 49 × 73</span><span id="snapshot-age">等待快照</span><span>服务端权威状态 · 5 Hz</span></div>
       </section>
       <aside class="sidebar">
-        <section class="side-card demo-card"><span class="section-kicker">QUICK START</span><h2>看一场夺旗</h2><p>红蓝双方同时夺旗，被抓后等待获释再继续。直接观察真实对局。</p><button id="start-demo" class="primary-button" disabled><span aria-hidden="true">▶</span>开始演示局</button><p id="demo-status" class="demo-status" role="status">正在连接 Paper…</p></section>
+        <section class="side-card demo-card"><span class="section-kicker">LAUNCHER</span><h2>启动比赛</h2>
+          <div class="launch-grid">
+            <label class="launch-field">对局类型<select id="launch-mode"><option value="both">对抗局（红蓝）</option><option value="red">红队单队测试</option></select></label>
+            <fieldset class="launch-team"><legend>红队</legend>
+              <label>walk-smart ×<input id="red-smart" type="number" min="0" max="8" value="2"></label>
+              <label>simple ×<input id="red-simple" type="number" min="0" max="8" value="1"></label>
+            </fieldset>
+            <fieldset class="launch-team" id="blue-fields"><legend>蓝队</legend>
+              <label>walk-smart ×<input id="blue-smart" type="number" min="0" max="8" value="2"></label>
+              <label>simple ×<input id="blue-simple" type="number" min="0" max="8" value="1"></label>
+            </fieldset>
+            <fieldset class="launch-team"><legend>地图</legend>
+              <label>地图<select id="map-mode"><option value="fixed">fixed</option><option value="random">random</option></select></label>
+              <label>障碍<select id="map-obstacles"><option value="">默认</option><option value="0">无</option><option value="fixed">fixed</option><option value="random">random</option></select></label>
+              <label>旗座<select id="map-stands"><option value="">默认</option><option value="fixed">fixed</option><option value="random">random</option></select></label>
+              <label>种子<input id="map-seed" type="text" placeholder="可选" inputmode="numeric"></label>
+            </fieldset>
+          </div>
+          <div class="launch-buttons"><button id="launch-btn" class="primary-button" disabled><span aria-hidden="true">▶</span>启动比赛</button><button id="stop-btn" class="ghost-button" disabled>■ 停止</button></div>
+          <p id="demo-status" class="demo-status" role="status">正在连接 Paper…</p>
+        </section>
         <section class="side-card players-card"><div class="section-heading"><h2>场上玩家</h2><span id="player-count" class="count-tag">0</span></div><div id="player-list" class="player-list"><p class="empty-message">暂无玩家进入赛场</p></div></section>
         <section class="side-card events-card"><div class="section-heading"><h2>比赛动态</h2><span class="live-label">LIVE</span></div><div id="event-list" class="event-list"><p class="empty-message">等待开局事件</p></div></section>
         <div class="spectator-note"><span aria-hidden="true">◉</span><p>这是俯视观战工具，不是完整 Minecraft 客户端。切换视角不会改变队伍或规则。</p></div>

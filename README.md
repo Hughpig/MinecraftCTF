@@ -166,7 +166,7 @@ npm start
 http://127.0.0.1:3000
 ```
 
-点击“开始演示局”会启动两个只连接本机 Paper 的 Mineflayer bot。演示使用双方同时行动路线；页面显示的数据来自：
+右侧「启动比赛」面板可配置对局类型（对抗局 / 红队单队测试）、每队 bot 风格与人数（walk-smart / simple，可队内混编）以及地图参数（地图、障碍、旗座、随机种子），点击启动后会拉起对应的 bot 进程；「停止」按钮可随时终止。页面显示的数据来自：
 
 ```text
 server/plugins/MinecraftCTF/viewer-state.json
@@ -263,6 +263,45 @@ npm run walk-smart *> .\logs\walk-smart-loop.log
 
 `CTF_COMPARE_FLAG_SEARCH=1` 可额外对比一次旧搜索与当前搜索的耗时；旧搜索本身会造成停顿，仅用于诊断。旧搜索最多返回 32 个结果，地图有残留旗帜时两者结果数量可能不同。
 
+## 启动器
+
+两种方式拉起一局比赛，共享同一套分组逻辑（`scripts/launch-groups.js`）：
+
+**viewer 面板**：浏览器打开 `http://127.0.0.1:3000`，在「启动比赛」面板填写参数后点击启动。
+
+**命令行**：
+
+```powershell
+# 3v3 对抗局，红队 2 个 walk-smart + 1 个 simple，随机地图固定种子
+npm run launch -- --red 2:smart,1:simple --blue 3:smart --map random --seed 42
+
+# 红队单队测试（enemy:none），1 个 walk-smart
+npm run launch -- --red 1:smart --enemy none
+```
+
+参数：`--red` / `--blue` 为 `数量:smart|simple` 逗号分隔的混编列表；`--map fixed|random`；`--obstacles 0|fixed|random`；`--stands fixed|random`；`--seed 整数`；`--enemy none` 切换单队测试。固定阵营的 bot 使用 `RS_/RX_/BS_/BX_` 前缀用户名（红/蓝 × smart/simple），同一局内的用户名互不冲突。
+
+bot 脚本可用的环境变量（启动器会自动设置，也可手动覆盖）：
+
+| 变量 | 说明 |
+| --- | --- |
+| `CTF_TEAM_SIDE` | `left`/`right`：bot 启动后逐个 `/ctf join` 固定阵营，不设则由服务端自动平衡 |
+| `CTF_NAME_PREFIX` | 用户名前缀（默认 `LocalCTF`） |
+| `CTF_MAP_MODE` | match 消息里的 `map:` 值（默认 `fixed`） |
+| `CTF_MATCH_EXTRA` | 追加到 match 消息的地图参数串（如 `obstacles:fixed stands:random seed:7`） |
+| `CTF_ENEMY` | `bot`（默认）或 `none`（单队测试局） |
+| `CTF_SETUP` | `0` 时首个 bot 不发送 `/ctf setup`（多进程启动时仅第一组发送） |
+
+## bot 绕障碍与对抗行为
+
+bot 的移动使用共享的轻量转向避障（`bot-test/ctf-steer.js`）：沿行进方向探测 2 格高的障碍（树木），被挡时选择空侧绕行路点，通过后自动恢复直线；单格障碍仍走跳跃逻辑，彻底卡死时退回原有的侧移兜底。未来可替换为 pathfinder 或自研寻路而不影响调用方。
+
+walk-smart 额外的对抗行为：
+
+- 防守角色与巡逻中的 bot 在己方半场发现敌方玩家即追捕；
+- 进攻 bot 未携旗回城途中若 6 格内有敌方玩家，先进行最多 6 秒的追捕再继续夺旗路线；
+- 携旗或身处敌方半场时，躲闪半径从 3.5 格扩大到 4.5 格、持续时间更长，且躲闪方向为远离对手的一侧。
+
 ## 单队自由移动 viewer 测试
 
 如果只想验证 Paper、插件状态快照和 viewer 的连续移动，可以启动一名不抢旗的单队移动 bot：
@@ -320,7 +359,7 @@ Minecraft Java 客户端 / 轻量协议 bot
 ## 当前限制
 
 - 地图支持固定/随机障碍与旗座参数，但随机地图没有可达性校验器（靠生成约束保证）。
-- 本地 smoke/walk bot 仍按固定路线直线寻路，遇到树木障碍会卡住；障碍局请先用于人工或观战验证，bot 避障留待 bot 端改造。
+- bot 绕障是轻量转向（探测+切线绕行），不是完整寻路：复杂障碍组合下仍可能卡顿绕远，接口已预留替换 pathfinder/自研寻路。
 - viewer 是二维观战界面，不渲染完整 Minecraft 3D 世界。
 - 断线重连、权限分层、反作弊和正式比赛服安全加固尚未完成。
 - 事件日志目前以 JSONL 保存，暂未提供回放页面和统计导出。

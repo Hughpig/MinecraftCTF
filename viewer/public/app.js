@@ -26,7 +26,9 @@ const elements = Object.fromEntries([
   'connection-dot', 'connection-text', 'left-score', 'right-score', 'left-progress', 'right-progress',
   'phase', 'timer', 'result-text', 'perspective-badge', 'perspective-title', 'red-view', 'blue-view',
   'show-labels', 'map-overlay', 'overlay-title', 'overlay-text', 'hover-info', 'snapshot-age',
-  'start-demo', 'demo-status', 'player-list', 'player-count', 'event-list'
+  'start-demo', 'demo-status', 'player-list', 'player-count', 'event-list',
+  'launch-btn', 'stop-btn', 'launch-mode', 'red-smart', 'red-simple', 'blue-smart', 'blue-simple',
+  'map-mode', 'map-obstacles', 'map-stands', 'map-seed'
 ].map(id => [id, document.getElementById(id)]));
 const colors = { left: '#f24d62', right: '#2689ee', spectator: '#8994a6' };
 const teamNames = { left: '红队', right: '蓝队', spectator: '观战者' };
@@ -207,15 +209,16 @@ function renderHud() {
   elements['map-overlay'].classList.toggle('hidden', !!online && snapshot.mapBuilt);
   if (!online) {
     setText(elements['overlay-title'], snapshot ? '服务端数据已暂停' : '等待服务端数据');
-    setText(elements['overlay-text'], snapshot ? 'Paper 未运行或连接中断。背景保留的是最后一次快照，不是实时画面。' : '请先启动更新后的 Paper 服务端，再点击「开始演示局」。');
+    setText(elements['overlay-text'], snapshot ? 'Paper 未运行或连接中断。背景保留的是最后一次快照，不是实时画面。' : '请先启动 Paper 服务端，再在启动面板里开始比赛。');
   } else if (!snapshot.mapBuilt) {
     setText(elements['overlay-title'], '服务端已连接，等待生成地图');
-    setText(elements['overlay-text'], '点击「开始演示局」，机器人会生成固定地图并自动开局。');
+    setText(elements['overlay-text'], '点击「启动比赛」，机器人会按参数生成地图并自动开局。');
   }
   const demoRunning = envelope.demo.status === 'running' || demoPending;
-  elements['start-demo'].disabled = !online || !token || demoRunning || snapshot?.phase === 'running';
-  setText(elements['start-demo'], demoRunning ? '演示局运行中…' : snapshot?.phase === 'running' ? '比赛正在进行' : '▶ 开始演示局');
-  setText(elements['demo-status'], demoError || (!online ? '先启动 Paper，网页会自动连接。' : demoRunning ? '正在运行真实本地机器人比赛。' : envelope.demo.status === 'succeeded' ? '上一局验证通过，可再次演示。' : envelope.demo.status === 'failed' ? envelope.demo.message : '演示会生成地图；只连接本机服务器。'));
+  elements['launch-btn'].disabled = !online || !token || demoRunning || snapshot?.phase === 'running';
+  setText(elements['launch-btn'], demoRunning ? '机器人运行中…' : snapshot?.phase === 'running' ? '比赛正在进行' : '▶ 启动比赛');
+  elements['stop-btn'].disabled = envelope.demo.status !== 'running';
+  setText(elements['demo-status'], demoError || (!online ? '先启动 Paper，网页会自动连接。' : demoRunning ? '正在运行真实本地机器人比赛。' : envelope.demo.status === 'succeeded' ? envelope.demo.message : envelope.demo.status === 'failed' ? envelope.demo.message : '填写参数后启动，机器人只连接本机服务器。'));
   scheduleDetailsRender();
 }
 
@@ -601,14 +604,47 @@ function setPerspective(team) {
 elements['red-view'].addEventListener('click', () => setPerspective('left'));
 elements['blue-view'].addEventListener('click', () => setPerspective('right'));
 elements['show-labels'].addEventListener('change', () => { staticLayerDirty = true; });
-elements['start-demo'].addEventListener('click', async () => {
+function readLaunchConfig() {
+  const count = id => Math.max(0, Math.min(8, Number(elements[id].value) || 0));
+  return {
+    mode: elements['launch-mode'].value,
+    red: { smart: count('red-smart'), simple: count('red-simple') },
+    blue: { smart: count('blue-smart'), simple: count('blue-simple') },
+    map: {
+      mode: elements['map-mode'].value,
+      obstacles: elements['map-obstacles'].value,
+      stands: elements['map-stands'].value,
+      seed: elements['map-seed'].value.trim()
+    }
+  };
+}
+
+elements['launch-btn'].addEventListener('click', async () => {
   demoPending = true; demoError = ''; renderHud();
   try {
-    const response = await fetch('/api/demo', { method: 'POST', headers: { 'X-Viewer-Token': token } });
+    const response = await fetch('/api/launch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Viewer-Token': token },
+      body: JSON.stringify(readLaunchConfig())
+    });
     const result = await response.json();
-    if (!response.ok) throw new Error(result.error || '演示启动失败');
+    if (!response.ok) throw new Error(result.error || '启动失败');
   } catch (error) { demoError = error.message; }
   finally { demoPending = false; renderHud(); }
+});
+
+elements['stop-btn'].addEventListener('click', async () => {
+  try {
+    const response = await fetch('/api/stop', { method: 'POST', headers: { 'X-Viewer-Token': token } });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '停止失败');
+  } catch (error) { demoError = error.message; }
+  renderHud();
+});
+
+elements['launch-mode'].addEventListener('change', () => {
+  const single = elements['launch-mode'].value === 'red';
+  for (const id of ['blue-smart', 'blue-simple']) elements[id].disabled = single;
 });
 canvas.addEventListener('mousemove', event => {
   if (!geometry || !envelope.snapshot?.mapBuilt) return;

@@ -4,6 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { composeGroups, scriptPath } = require('../scripts/launch-groups');
 
 const port = Number(process.env.CTF_VIEWER_PORT || 3000);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('CTF_VIEWER_PORT must be between 1024 and 65535');
@@ -23,7 +24,69 @@ let snapshot = null;
 let cachedBlocks = null;
 let cachedBlocksKey = null;
 let demo = { status: 'idle', message: '' };
-let demoProcess = null;
+const demoProcesses = new Set();
+let stopRequested = false;
+
+function stopDemoProcesses() {
+  for (const child of demoProcesses) {
+    try { child.kill(); } catch (_) {}
+  }
+}
+
+function startLaunch(config) {
+  const groups = composeGroups(config);
+  stopDemoProcesses();
+  stopRequested = false;
+  demo = { status: 'running', message: `已启动 ${groups.map(group => `${group.label}×${group.count}`).join('、')}，机器人正在连接本地 Paper…` };
+  let output = '';
+  let closed = 0;
+  let failed = 0;
+  const collect = chunk => { output = (output + chunk.toString()).slice(-16000); };
+  for (const group of groups) {
+    const child = spawn(process.execPath, [scriptPath(root, group.style)], {
+      cwd: path.join(root, 'bot-test'),
+      windowsHide: true,
+      env: { ...process.env, CTF_HOST: '127.0.0.1', CTF_PORT: '25565', ...group.env },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    demoProcesses.add(child);
+    child.stdout.on('data', collect);
+    child.stderr.on('data', collect);
+    child.on('error', error => {
+      failed++;
+      demo = { status: 'failed', message: `${group.label} 启动失败：${error.message}` };
+      broadcast();
+    });
+    child.on('close', code => {
+      demoProcesses.delete(child);
+      closed++;
+      if (code !== 0) failed++;
+      if (closed === groups.length && !stopRequested) {
+        const smoke = output.split(/\r?\n/).findLast(line => line.includes('[smoke]'));
+        demo = failed > 0
+          ? { status: 'failed', message: smoke || `${failed}/${groups.length} 个机器人进程异常退出` }
+          : { status: 'succeeded', message: smoke || '全部机器人已退出' };
+        broadcast();
+      }
+    });
+  }
+  broadcast();
+}
+
+function readBody(request) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    request.on('data', chunk => {
+      body += chunk;
+      if (body.length > 4096) {
+        reject(new Error('请求体过大'));
+        request.destroy();
+      }
+    });
+    request.on('end', () => resolve(body));
+    request.on('error', reject);
+  });
+}
 let previousState = null;
 let previousSnapshot = '';
 let reading = false;
@@ -132,14 +195,30 @@ const server = http.createServer(async (request, response) => {
   response.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'none'");
   if (!allowedHosts.has(request.headers.host)) return json(response, 403, { error: 'Local viewer host required' });
   const pathname = new URL(request.url, `http://127.0.0.1:${port}`).pathname;
-  if (pathname === '/api/demo' && request.method === 'POST') {
+  if (pathname === '/api/launch' && request.method === 'POST') {
     const origin = request.headers.origin;
     if (!origin || ![...allowedHosts].some(host => origin === `http://${host}`) || request.headers['x-viewer-token'] !== token)
-      return json(response, 403, { error: '请从本机 viewer 页面启动演示。' });
+      return json(response, 403, { error: '请从本机 viewer 页面启动。' });
     const state = currentState();
-    if (!state.connected) return json(response, 409, { error: 'Paper 尚未连接，请先启动更新后的服务端。' });
-    if (demoProcess || snapshot.phase === 'running') return json(response, 409, { error: '已有比赛或演示正在进行。' });
-    startDemo();
+    if (!state.connected) return json(response, 409, { error: 'Paper 尚未连接，请先启动服务端。' });
+    if (demoProcesses.size > 0 || snapshot.phase === 'running') return json(response, 409, { error: '已有比赛或演示正在进行。' });
+    try {
+      const config = JSON.parse((await readBody(request)) || '{}');
+      startLaunch(config);
+      return json(response, 202, { ok: true });
+    } catch (error) {
+      return json(response, 400, { error: error.message });
+    }
+  }
+  if (pathname === '/api/stop' && request.method === 'POST') {
+    const origin = request.headers.origin;
+    if (!origin || ![...allowedHosts].some(host => origin === `http://${host}`) || request.headers['x-viewer-token'] !== token)
+      return json(response, 403, { error: '请从本机 viewer 页面操作。' });
+    if (demoProcesses.size === 0) return json(response, 409, { error: '当前没有运行中的机器人。' });
+    stopRequested = true;
+    demo = { status: 'idle', message: '已停止，可再次启动。' };
+    stopDemoProcesses();
+    broadcast();
     return json(response, 202, { ok: true });
   }
   if (request.method !== 'GET') return json(response, 405, { error: 'Method not allowed' });
@@ -190,7 +269,7 @@ server.listen(port, '127.0.0.1', () => {
 function shutdown() {
   clearInterval(refreshTimer); clearInterval(heartbeatTimer);
   snapshotWatcher?.close();
-  if (demoProcess) demoProcess.kill();
+  stopDemoProcesses();
   for (const client of clients) client.end();
   server.close();
 }

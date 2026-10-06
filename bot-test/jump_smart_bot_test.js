@@ -6,6 +6,7 @@ const findArenaGoals = require('./arena-goal-search');
 const waitForInitialWorld = require('./startup-world');
 const { planSteer, strafeSideForAway, makeBlockProbe, nearestFreeCell } = require('./ctf-steer');
 const { CHAT_PREFIX, parseCoordination, claimKey, claimMessage, unclaimMessage, rescueMessage, freedMessage } = require('./ctf-coord');
+const { takeNearest } = require('./flag-state');
 
 const HOST = process.env.CTF_HOST || '127.0.0.1';
 const PORT = Number(process.env.CTF_PORT || 25565);
@@ -44,6 +45,21 @@ const log = (name, message) => console.log(`[${new Date().toISOString()}] [${nam
 const CLAIM_LEASE_MS = 15000;
 const JAIL_ENTRY_TIMEOUT_MS = 32000; // past 30s the timer opens the door anyway
 const RESCUE_LEASE_MS = 25000;       // matches the plate walk + hold budget
+const scanStats = { enemyScans: 0, goalScans: 0, goalLockReads: 0 };
+const FLAG_RESCAN_MS = 5000; // reconciliation safety net for missed events (e.g. a quitting carrier)
+
+// Broadcast-maintained banner/goal tables, one per team per process: every
+// pickup/deposit/jail broadcast mutates them, so route code consults a Map
+// instead of re-reading up to 1.5k world blocks every few hundred ms.
+// "dirty" forces a bounded rescan — capture drops re-plant flags at positions
+// nobody announces, and a quitting carrier's drop is never broadcast at all.
+const flagState = {};
+for (const team of ['left', 'right']) {
+  flagState[team] = {
+    enemy: new Map(), dirty: true, scannedAt: 0, lastPickup: { who: '', at: 0 },
+    goals: new Map(), goalsDirty: true
+  };
+}
 const teamCoordination = {};
 for (const team of ['left', 'right']) {
   teamCoordination[team] = { claims: new Map(), jailed: new Map(), rescuers: new Map(), rescue: null };
@@ -102,6 +118,9 @@ function noteJail(bot, message) {
   // A jailed rescuer cannot reach the plate: their epoch is dead and someone
   // else must be able to claim the rescue.
   if (c.rescue && c.rescue.by === who) c.rescue = null;
+  // If they were carrying, their flag re-planted at an unannounced spot: the
+  // banner table needs a fresh scan.
+  flagState[bot.ctf.team].dirty = true;
 }
 
 // Mirror a teammate's [CTFC] line into the shared coordination state.
@@ -234,6 +253,15 @@ function makeBot(index) {
     if (coord) applyCoordination(bot, coord);
     if (message.includes('地图已生成：') || message.includes('地图已就绪：')) {
       confirmMapReady();
+      // A rebuilt map invalidates every remembered banner/goal cell.
+      for (const state of Object.values(flagState)) {
+        state.enemy.clear(); state.dirty = true; state.lastPickup = { who: '', at: 0 };
+        state.goals.clear(); state.goalsDirty = true;
+      }
+    }
+    if (message.includes(' 夺取了 ') && message.includes('队的一面旗')) noteFlagPickup(bot, message);
+    if (bot.ctf.team && message.includes(`${bot.ctf.team === 'left' ? '左' : '右'} 队已插旗 `)) {
+      flagState[bot.ctf.team].goalsDirty = true;
     }
     if (message.includes('Are you ready?')) bot.chat("I'm ready!");
     if (message.startsWith('Game start: ')) {
@@ -269,7 +297,11 @@ function makeBot(index) {
     }
     if (message.includes('你携带了')) { bot.ctf.carrying = true; bot.ctf.pickups++; }
     if (message.includes('插旗成功！')) { bot.ctf.carrying = false; bot.ctf.captures++; }
-    if (message.includes('旗已在附近重新立起')) bot.ctf.carrying = false;
+    if (message.includes('旗已在附近重新立起')) {
+      bot.ctf.carrying = false;
+      // Our carried flag re-planted at an unannounced nearby cell.
+      if (bot.ctf.team) flagState[bot.ctf.team].dirty = true;
+    }
     if (message.includes(`${username} 被抓捕并关入`) || (message.includes('你被 ') && message.includes('抓捕，监禁'))) {
       bot.ctf.jailed = true;
     }
@@ -452,20 +484,52 @@ async function waitFor(bot, predicate, description) {
   if (!stopping && !predicate()) throw new Error(`server did not confirm ${description}`);
 }
 
-function scanEnemyBanners(bot) {
-  const blockName = bot.ctf.team === 'left' ? 'blue_banner' : 'red_banner';
-  const block = bot.registry.blocksByName[blockName];
-  if (!block || !bot.entity) return null;
+function noteFlagPickup(bot, message) {
+  // "[CTF] NAME 夺取了 右 队的一面旗。" — only our own team can pick the
+  // banners we attack, and the picker stands on the cell at pickup time.
+  if (!bot.ctf.team) return;
+  const enemyLabel = bot.ctf.team === 'left' ? '右' : '左';
+  if (!message.includes(`夺取了 ${enemyLabel} 队的一面旗`)) return;
+  const who = message.split(' 夺取了')[0].replace('[CTF] ', '').trim();
+  if (who !== bot.username && !bot.ctf.teammates.has(who)) return;
+  const state = flagState[bot.ctf.team];
   const now = Date.now();
-  if (bot.ctf.flagScan && now - bot.ctf.flagScan.at < 700) return bot.ctf.flagScan.positions;
-  bot.ctf.flagScan = { at: now, positions: findArenaFlags(bot, block.id) };
-  return bot.ctf.flagScan.positions;
+  if (state.lastPickup.who === who && now - state.lastPickup.at < 2000) return; // a process-mate already applied it
+  state.lastPickup = { who, at: now };
+  const ent = entityByUsername(bot, who);
+  const at = ent ? ent.position : bot.entity ? bot.entity.position : null;
+  if (at) takeNearest(state.enemy, at.x, at.z);
+  else state.dirty = true; // picker out of view: rescan to find the gap
+}
+
+function refreshEnemyFlags(bot) {
+  // Live enemy banner cells: broadcast-maintained, reconciled by a bounded
+  // scan at most every FLAG_RESCAN_MS or when a drop marked it dirty.
+  if (!bot.ctf.team) return [];
+  const state = flagState[bot.ctf.team];
+  if (state.dirty || Date.now() - state.scannedAt > FLAG_RESCAN_MS) {
+    const blockName = bot.ctf.team === 'left' ? 'blue_banner' : 'red_banner';
+    const block = bot.registry.blocksByName[blockName];
+    state.enemy = new Map();
+    if (block && bot.entity) {
+      scanStats.enemyScans++;
+      for (const p of findArenaFlags(bot, block.id)) {
+        state.enemy.set(claimKey(p.x, p.z), { x: p.x, z: p.z });
+      }
+    }
+    state.dirty = false;
+    state.scannedAt = Date.now();
+  }
+  return [...state.enemy.values()].map(cell => new Vec3(cell.x, 64, cell.z));
 }
 
 function isBannerGone(bot, position) {
-  const positions = scanEnemyBanners(bot);
-  if (!positions) return false;
-  return !positions.some(p => Math.abs(p.x - position.x) < 0.6 && Math.abs(p.z - position.z) < 0.6);
+  // Event-driven: pickup broadcasts remove banners from the live table, so
+  // this is a Map lookup instead of a full-half block scan.
+  if (!bot.ctf.team) return false;
+  const state = flagState[bot.ctf.team];
+  if (state.scannedAt === 0 || state.dirty) return false; // unknown; the pickup wait decides
+  return !state.enemy.has(claimKey(position.x, position.z));
 }
 
 function findEnemyFlag(bot, preferredX, preferredZ, homeSign, attempt = 0) {
@@ -501,15 +565,15 @@ async function waitForEnemyBanner(bot) {
   const started = Date.now();
   let walked = false;
   while (!stopping && Date.now() - started < 15000) {
-    const positions = scanEnemyBanners(bot);
-    if (positions && positions.length > 0) return positions;
+    const positions = refreshEnemyFlags(bot);
+    if (positions.length > 0) return positions;
     // Late in a match the surviving banners can sit beyond the loaded chunks
     // (view distance 3). Standing at the prison door polling is capture bait;
     // walk toward the enemy half until one scrolls into view.
     if (!walked && bot.entity) {
       walked = true;
       await goNear(bot, -homeSign(bot) * 6, bot.entity.position.z,
-        () => { const p = scanEnemyBanners(bot); return !!p && p.length > 0; }, { maxDuration: 7000 });
+        () => refreshEnemyFlags(bot).length > 0, { maxDuration: 7000 });
     }
     await sleep(150);
   }
@@ -517,7 +581,32 @@ async function waitForEnemyBanner(bot) {
 }
 
 function isGoalLocked(bot, goal) {
+  scanStats.goalLockReads++;
   return bot.world.getBlockType(new Vec3(goal.x, 64, goal.z)) !== 0;
+}
+
+function refreshHomeGoal(bot) {
+  // Nearest unlocked home goal from the broadcast-maintained table; deposits
+  // mark it dirty and the next carrier rescans (goals never change on their
+  // own, so no staleness guard is needed).
+  if (!bot.ctf.team || !bot.entity) return null;
+  const state = flagState[bot.ctf.team];
+  if (state.goalsDirty) {
+    state.goals = new Map();
+    scanStats.goalScans++;
+    for (const g of findArenaGoals(bot)) state.goals.set(claimKey(g.x, g.z), { x: g.x, z: g.z });
+    state.goalsDirty = false;
+  }
+  let best = null;
+  let bestDistance = Infinity;
+  for (const cell of state.goals.values()) {
+    const distance = (cell.x - bot.entity.position.x) ** 2 + (cell.z - bot.entity.position.z) ** 2;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = cell;
+    }
+  }
+  return best ? { ...best } : null;
 }
 
 // Nearest unlocked home goal. Random stand layouts put goals anywhere, so
@@ -526,18 +615,15 @@ async function waitForHomeGoal(bot) {
   const started = Date.now();
   let walked = false;
   while (!stopping && Date.now() - started < 20000) {
-    const goals = findArenaGoals(bot);
-    if (goals.length > 0 && bot.entity) {
-      goals.sort((a, b) => a.distanceSquared(bot.entity.position) - b.distanceSquared(bot.entity.position));
-      return goals[0];
-    }
+    const goal = refreshHomeGoal(bot);
+    if (goal) return goal;
     // From the far enemy side the home goals sit outside the loaded chunks
-    // and the scan comes up empty; walk toward home until one scrolls in
-    // instead of standing still as capture bait.
+    // and the table is empty; walk toward home until one scrolls in instead
+    // of standing still as capture bait.
     if (!walked && bot.entity) {
       walked = true;
       await goNear(bot, homeSign(bot) * 2, bot.entity.position.z,
-        () => findArenaGoals(bot).length > 0, { maxDuration: 8000 });
+        () => !!refreshHomeGoal(bot), { maxDuration: 8000 });
     }
     await sleep(100);
   }
@@ -746,6 +832,7 @@ function stopAll() {
   const passed = gameEnded && pickups > 0 && captures > 0;
   process.exitCode = passed ? 0 : 1;
   log('smoke', `${passed ? 'PASS' : 'FAIL'}: pickups=${pickups}, captures=${captures}, routeFailures=${routeFailures}, gameEnded=${gameEnded}`);
+  log('smoke', `scans: enemyScans=${scanStats.enemyScans}, goalScans=${scanStats.goalScans}, goalLockReads=${scanStats.goalLockReads}`);
   for (const bot of bots) {
     try { bot.clearControlStates(); bot.quit('local CTF smoke test finished'); } catch (_) {}
   }

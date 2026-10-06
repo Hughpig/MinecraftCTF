@@ -19,6 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from javascript import require  # noqa: E402
 import ctf_coord  # noqa: E402
 import ctf_steer  # noqa: E402
+import flag_state as flag_state_mod  # noqa: E402
+import mf  # noqa: E402
 from mf import BridgeBot  # noqa: E402
 
 HOST = os.environ.get("CTF_HOST", "127.0.0.1")
@@ -42,6 +44,7 @@ FLAG_ROWS = [-30, -22, -14, -6]
 CLAIM_LEASE_MS = 15000
 JAIL_ENTRY_TIMEOUT_S = 32.0
 RESCUE_LEASE_S = 25.0  # matches the plate walk + hold budget; stale epochs re-claim
+FLAG_RESCAN_S = 5.0    # reconciliation safety net for missed events (e.g. a quitting carrier)
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(message)s",
                     datefmt="%H:%M:%S")
@@ -50,6 +53,7 @@ log = logging.getLogger("mf-jump")
 stopping = False
 game_ended = False
 stats = {"pickups": 0, "captures": 0, "route_failures": 0}
+scan_stats = {"enemy_scans": 0, "goal_scans": 0}
 stats_lock = threading.Lock()
 confirm_map_ready = threading.Event()
 
@@ -61,6 +65,17 @@ confirm_map_ready = threading.Event()
 coordination = {team: {"claims": {}, "jailed": {}, "rescuers": {}, "rescue": None}
                 for team in ("left", "right")}
 coordination_lock = threading.RLock()
+
+# Live banner/goal tables maintained from broadcasts, one per team per process:
+# every pickup/deposit/jail broadcast mutates them, so route code consults a
+# dict instead of re-reading up to 1.5k world blocks every few hundred ms.
+# "dirty" forces a bounded rescan — capture drops re-plant flags at positions
+# nobody announces, and a quitting carrier's drop is never broadcast at all.
+flag_state = {team: {"enemy": {}, "dirty": True, "scanned_at": 0.0,
+                     "last_pickup": ("", 0.0),
+                     "goals": {}, "goals_dirty": True}
+              for team in ("left", "right")}
+flag_state_lock = threading.RLock()
 
 
 def is_in_prison_cell(position):
@@ -129,6 +144,18 @@ class PyJumpBot:
             self.apply_coordination(*coord)
         if "地图已生成：" in text or "地图已就绪：" in text:
             confirm_map_ready.set()
+            # A rebuilt map invalidates every remembered banner/goal cell.
+            with flag_state_lock:
+                for state in flag_state.values():
+                    state["enemy"] = {}
+                    state["dirty"] = True
+                    state["last_pickup"] = ("", 0.0)
+                    state["goals"] = {}
+                    state["goals_dirty"] = True
+        if " 夺取了 " in text and "队的一面旗" in text:
+            self.note_flag_pickup(text)
+        if " 队已插旗 " in text:
+            self.note_flag_deposit(text)
         if "Are you ready?" in text:
             self.bot.chat("I'm ready!")
         if text.startswith("Game start: "):
@@ -146,6 +173,10 @@ class PyJumpBot:
             self.notify_waiters()
         if "旗已在附近重新立起" in text:
             self.carrying = False
+            # Our carried flag re-planted at an unannounced nearby cell.
+            if self.team:
+                with flag_state_lock:
+                    flag_state[self.team]["dirty"] = True
             self.notify_waiters()
         if (f"{self.username} 被抓捕并关入" in text) or ("你被 " in text and "抓捕，监禁" in text):
             self.carrying = False
@@ -181,6 +212,10 @@ class PyJumpBot:
             # someone else must be able to claim the rescue.
             if c.get("rescue") and c["rescue"]["by"] == who:
                 c["rescue"] = None
+            # If they were carrying, their flag re-planted at an unannounced
+            # spot: the banner table needs a fresh scan.
+            with flag_state_lock:
+                flag_state[self.team]["dirty"] = True
 
     # -- [CTFC] team chat -----------------------------------------------------
 
@@ -219,6 +254,61 @@ class PyJumpBot:
             elif command == "f":
                 c["jailed"].clear()
                 c["rescue"] = None
+
+    # -- broadcast-driven banner/goal state ----------------------------------
+
+    def note_flag_pickup(self, message):
+        """'[CTF] NAME 夺取了 右 队的一面旗。' — only our own team can pick the
+        banners we attack, and the picker stands on the cell at pickup time."""
+        if not self.team:
+            return
+        if " 夺取了 右 队的一面旗" in message:
+            owner = "right"
+        elif " 夺取了 左 队的一面旗" in message:
+            owner = "left"
+        else:
+            return
+        if owner == self.team:
+            return  # an enemy took one of OUR flags; their banners are untouched
+        who = message.split(" 夺取了")[0].replace("[CTF] ", "").strip()
+        if who != self.username and who not in self.teammates:
+            return
+        with flag_state_lock:
+            state = flag_state[self.team]
+            now = time.time()
+            if state["last_pickup"][0] == who and now - state["last_pickup"][1] < 2.0:
+                return  # a process-mate's chat handler already applied this one
+            state["last_pickup"] = (who, now)
+            at = self.position() if who == self.username else self.bot.entity_position(who)
+            if at:
+                flag_state_mod.take_nearest(state["enemy"], at["x"], at["z"])
+            else:
+                state["dirty"] = True  # picker out of view: rescan to find the gap
+
+    def note_flag_deposit(self, message):
+        """'[CTF] 左 队已插旗 N/8。' — the deposit locks a goal cell but the
+        broadcast carries no position, so the next goal consumer rescans."""
+        if not self.team:
+            return
+        if f"{'左' if self.team == 'left' else '右'} 队已插旗 " in message:
+            with flag_state_lock:
+                flag_state[self.team]["goals_dirty"] = True
+
+    def refresh_enemy_flags(self):
+        """Live enemy banner cells: broadcast-maintained, reconciled by a
+        bounded scan at most every FLAG_RESCAN_S or when a drop marked it dirty."""
+        if not self.team:
+            return []
+        with flag_state_lock:
+            state = flag_state[self.team]
+            now = time.time()
+            if state["dirty"] or now - state["scanned_at"] > FLAG_RESCAN_S:
+                positions = self.scan_enemy_banners()
+                state["enemy"] = {ctf_coord.claim_key(p["x"], p["z"]): {"x": p["x"], "z": p["z"]}
+                                  for p in positions}
+                state["dirty"] = False
+                state["scanned_at"] = now
+            return list(state["enemy"].values())
 
     def on_game_start(self, payload):
         try:
@@ -418,13 +508,20 @@ class PyJumpBot:
     # -- flags / claims ------------------------------------------------------
 
     def scan_enemy_banners(self):
+        with stats_lock:
+            scan_stats["enemy_scans"] += 1
         return self.bot.scan_enemy_banners(self.team)
 
     def is_banner_gone(self, cell):
-        # Cheap per-cell check: a picked-up flag leaves air behind. The old
-        # full-scan here blocked the Node physics loop every 700ms, which read
-        # as the bot "dashing then stopping" down the whole approach.
-        return self.bot.block_is_air(cell["x"], 64, cell["z"]) is True
+        # Event-driven: pickup broadcasts remove banners from the live table,
+        # so this is a dict lookup instead of a block read every physics tick.
+        if not self.team:
+            return False
+        with flag_state_lock:
+            state = flag_state[self.team]
+            if state["scanned_at"] == 0.0 or state["dirty"]:
+                return False  # table unknown or reconciling; the pickup wait decides
+            return ctf_coord.claim_key(cell["x"], cell["z"]) not in state["enemy"]
 
     def prune_claims(self):
         with coordination_lock:
@@ -477,7 +574,7 @@ class PyJumpBot:
         started = time.time()
         walked = False
         while not stopping and time.time() - started < 15:
-            positions = self.scan_enemy_banners()
+            positions = self.refresh_enemy_flags()
             if positions:
                 return positions
             # Late in a match the surviving banners can sit beyond the loaded
@@ -485,7 +582,7 @@ class PyJumpBot:
             if not walked:
                 walked = True
                 self.go_near(-self.home_sign() * 6, self.position()["z"],
-                             completed=lambda: bool(self.scan_enemy_banners()),
+                             completed=lambda: bool(self.refresh_enemy_flags()),
                              options={"maxDuration": 7})
             time.sleep(0.15)
         raise RuntimeError("no enemy banner available")
@@ -514,6 +611,8 @@ class PyJumpBot:
     def scan_home_goals(self):
         # Bounded Node-side scan (~2ms): own-half gold blocks with air above.
         # findBlocks here used to freeze the physics loop ~500ms per carrier.
+        with stats_lock:
+            scan_stats["goal_scans"] += 1
         try:
             # NB: pass the mineflayer proxy (self.bot.bot), not the Python
             # wrapper — Node calls bot.world.* natively on it during the scan.
@@ -523,19 +622,40 @@ class PyJumpBot:
             log.exception("goal scan failed")
             return []
 
+    def refresh_home_goals(self):
+        """Nearest unlocked home goal from the broadcast-maintained table;
+        deposits mark it dirty and the next carrier rescans (goals never
+        change on their own, so no staleness guard is needed)."""
+        if not self.team:
+            return None
+        own = self.position()
+        with flag_state_lock:
+            state = flag_state[self.team]
+            if state["goals_dirty"]:
+                goals = self.scan_home_goals()
+                state["goals"] = {ctf_coord.claim_key(g["x"], g["z"]): {"x": g["x"], "z": g["z"]}
+                                  for g in goals}
+                state["goals_dirty"] = False
+            best = None
+            best_distance = None
+            for cell in state["goals"].values():
+                distance = (cell["x"] - own["x"]) ** 2 + (cell["z"] - own["z"]) ** 2
+                if best_distance is None or distance < best_distance:
+                    best = dict(cell)
+                    best_distance = distance
+            return best
+
     def wait_for_home_goal(self):
         started = time.time()
         walked = False
         while not stopping and time.time() - started < 20:
-            goals = self.scan_home_goals()
-            if goals:
-                own = self.position()
-                goals.sort(key=lambda g: (g["x"] - own["x"]) ** 2 + (g["z"] - own["z"]) ** 2)
-                return goals[0]
+            goal = self.refresh_home_goals()
+            if goal:
+                return goal
             if not walked:
                 walked = True
                 self.go_near(self.home_sign() * 2, self.position()["z"],
-                             completed=lambda: bool(self.scan_home_goals()),
+                             completed=lambda: self.refresh_home_goals(),
                              options={"maxDuration": 8})
             time.sleep(0.1)
         raise RuntimeError("cannot find an unlocked home goal")
@@ -789,6 +909,8 @@ def stop_all():
     print(f"[smoke] {'PASS' if process_passed else 'FAIL'}: pickups={stats['pickups']}, "
           f"captures={stats['captures']}, routeFailures={failures}, gameEnded={bool(stats.get('game_ended'))}",
           flush=True)
+    print(f"[smoke] scans: enemyScans={scan_stats['enemy_scans']}, "
+          f"goalScans={scan_stats['goal_scans']}, blockReads={mf.BLOCK_READ_STATS['count']}", flush=True)
     global exit_code
     exit_code = 0 if process_passed else 1
     for bot in bots:

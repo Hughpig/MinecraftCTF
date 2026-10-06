@@ -23,6 +23,9 @@ log = logging.getLogger("mf")
 
 DOOR_SUFFIX = "_door"
 
+# Diagnostic counter: every block_is_air read (banner-gone checks, goal locks).
+BLOCK_READ_STATS = {"count": 0}
+
 # Node-side bounded scans (each one bridge call, ~2ms instead of findBlocks'
 # 500ms full-radius search that froze the physics loop mid-run).
 _NODE_SCANS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -169,6 +172,7 @@ class BridgeBot:
 
     def block_is_air(self, x, y, z):
         """True when the block is air; None means unknown (chunk not loaded)."""
+        BLOCK_READ_STATS["count"] += 1
         try:
             block = self.bot.blockAt(self.vec3(x, y, z))
         except Exception:

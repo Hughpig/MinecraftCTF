@@ -73,7 +73,7 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     private int requestedPlayers = 0;
     private boolean allowEmptyOpponent = false;
     private String requestedMapMode = "fixed";
-    private boolean readyPrompted = false;
+    private int promptedForSize = 0;
     private Path eventLog;
     private ExecutorService eventLogWriter;
     private ViewerStateWriter viewerWriter;
@@ -185,11 +185,10 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             viewerTeams.putAll(lobby);
             broadcast("地图已生成：" + describeMapOptions(map.options));
             event("map_setup", mapSetupEvent(map.options, false));
-            // A rebuild invalidates the earlier ready round (the prompt already
-            // fired once and start bounced into this rebuild). Reset and ask
-            // again so the match deterministically starts after the rebuild.
+            // A rebuild invalidates the earlier ready round: re-prompt so the
+            // match deterministically starts after the rebuild.
             lobby.keySet().forEach(id -> ready.put(id, false));
-            readyPrompted = false;
+            promptedForSize = 0;
             maybePromptReady();
         });
     }
@@ -489,7 +488,7 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         for (UUID id : match.players.keySet()) { Player p = Bukkit.getPlayer(id); if (p != null) p.sendMessage(Component.text("Game over!")); }
         event("match_end", Map.of("reason", reason, "left", left, "right", right, "result", result));
         for (UUID id : match.players.keySet()) { Player p = Bukkit.getPlayer(id); if (p != null) { dropCarriedFlag(p, "match_end"); p.setCollidable(true); clearCombatInventory(p); p.getInventory().setArmorContents(new ItemStack[4]); p.setGameMode(GameMode.ADVENTURE); p.teleport(map.lobby()); } }
-        match = null; lobby.clear(); ready.clear(); requestedPlayers = 0; allowEmptyOpponent = false; requestedMapMode = "fixed"; requestedMapOptions = MapOptions.LEGACY; readyPrompted = false;
+        match = null; lobby.clear(); ready.clear(); requestedPlayers = 0; allowEmptyOpponent = false; requestedMapMode = "fixed"; requestedMapOptions = MapOptions.LEGACY; promptedForSize = 0;
     }
 
     private void broadcast(String msg) { Bukkit.broadcast(Component.text("[CTF] " + msg)); }
@@ -620,8 +619,13 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
     }
 
     private void maybePromptReady() {
-        if (readyPrompted || !lobbyReadyToPrompt()) return;
-        readyPrompted = true;
+        if (!lobbyReadyToPrompt()) return;
+        // Re-prompt whenever any lobby member has not readied yet: launcher
+        // groups spawn bots over several seconds, so late joiners must also
+        // receive the prompt (a one-shot latch left them stranded unready).
+        boolean unready = lobby.keySet().stream().anyMatch(id -> !ready.getOrDefault(id, false));
+        if (!unready) return;
+        promptedForSize = lobby.size();
         for (UUID id : lobby.keySet()) { Player p = Bukkit.getPlayer(id); if (p != null) p.sendMessage(Component.text("Are you ready?")); }
         event("ready_prompt", Map.of("players", lobby.size(), "players_per_team", requestedPlayers, "map", requestedMapMode));
     }

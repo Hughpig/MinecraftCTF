@@ -83,7 +83,6 @@ class PyJumpBot:
         self.rescue_target = None
         self.flag_scan = (0.0, [])
         self._gold_id = None
-        self._goal_cells = None
         self.state_waiters = []
         self.wait_lock = threading.Lock()
         self.bot = BridgeBot(mineflayer, vec3, HOST, PORT, self.username,
@@ -118,7 +117,6 @@ class PyJumpBot:
             return
         log.info("%s %s", self.username, text)
         if "地图已生成：" in text or "地图已就绪：" in text:
-            self._goal_cells = None
             confirm_map_ready.set()
         if "Are you ready?" in text:
             self.bot.chat("I'm ready!")
@@ -181,7 +179,6 @@ class PyJumpBot:
         self.role = "defender" if self.team_index == 0 else "attacker"
         self.opponents = set(teams["left" if self.team == "right" else "right"])
         self.teammates = set(teams[self.team]) - {self.username}
-        self.bot.ctf = {"team": self.team}  # Node-side, read by arena helpers
         self._gold_id = None
         if self.started:
             return
@@ -426,31 +423,16 @@ class PyJumpBot:
         return self.bot.block_is_air(goal["x"], 64, goal["z"]) is False
 
     def scan_home_goals(self):
-        # Goal cells are fixed for the whole match: scan the gold blocks once,
-        # then per-poll only the cheap air-above check. Repeated findBlocks
-        # here froze the Node physics loop while the carrier ran home.
-        if self._goal_cells is not None:
-            goals = self._goal_cells
-        else:
-            if self._gold_id is None:
-                gold = self.bot.bot.registry.blocksByName["gold_block"]
-                self._gold_id = int(gold.id)
-            sign = self.home_sign()
-            goals = []
-            try:
-                found = self.bot.bot.findBlocks({
-                    "matching": self._gold_id, "maxDistance": 96, "count": 32,
-                })
-            except Exception:
-                return goals
-            for p in found:
-                gx, gz = int(float(p.x)), int(float(p.z))
-                if gx * sign <= 1:
-                    continue
-                goals.append({"x": gx, "z": gz})
-            if goals:
-                self._goal_cells = goals
-        return [g for g in goals if self.bot.block_is_air(g["x"], 64, g["z"]) is True]
+        # Bounded Node-side scan (~2ms): own-half gold blocks with air above.
+        # findBlocks here used to freeze the physics loop ~500ms per carrier.
+        try:
+            # NB: pass the mineflayer proxy (self.bot.bot), not the Python
+            # wrapper — Node calls bot.world.* natively on it during the scan.
+            return [{"x": float(p.x), "z": float(p.z)}
+                    for p in self.bot.scans.goals(self.bot.bot, self.team)]
+        except Exception:
+            log.exception("goal scan failed")
+            return []
 
     def wait_for_home_goal(self):
         started = time.time()

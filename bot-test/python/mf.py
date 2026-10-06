@@ -13,6 +13,7 @@ keeps every hot-path value in Python caches:
 """
 
 import logging
+import os
 import threading
 import time
 
@@ -21,6 +22,11 @@ from javascript import require
 log = logging.getLogger("mf")
 
 DOOR_SUFFIX = "_door"
+
+# Node-side bounded scans (each one bridge call, ~2ms instead of findBlocks'
+# 500ms full-radius search that froze the physics loop mid-run).
+_NODE_SCANS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ARENA_SCANS = require(os.path.join(_NODE_SCANS_DIR, "arena-scan-bridge.js"))
 
 
 def safe(fn):
@@ -48,6 +54,7 @@ class BridgeBot:
         self.connected = False
         self.entities = {}      # username -> entity proxy (tracked players)
         self._scan_cache = (0.0, [])          # banner scan (at, positions)
+        self.scans = ARENA_SCANS
         self._probe_cache = {}                # (x, z, level) -> (solid, at)
         self._registry_id = None
         self._lock = threading.Lock()
@@ -150,16 +157,13 @@ class BridgeBot:
         return self._registry_id
 
     def scan_enemy_banners(self, team):
-        """Live enemy banner positions via one Node-side findBlocks call."""
+        """Live enemy banner positions via the bounded Node-side scan (~2ms)."""
         now = time.time()
         if now - self._scan_cache[0] < 0.7:
             return self._scan_cache[1]
         positions = []
         try:
-            found = self.bot.findBlocks({
-                "matching": self.enemy_banner_id(team), "maxDistance": 96, "count": 32,
-            })
-            for p in found:
+            for p in self.scans.flags(self.bot, self.enemy_banner_id(team), team):
                 positions.append({"x": float(p.x), "z": float(p.z)})
         except Exception:
             log.exception("banner scan failed")

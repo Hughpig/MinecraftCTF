@@ -27,7 +27,7 @@ const elements = Object.fromEntries([
   'phase', 'timer', 'result-text', 'perspective-badge', 'perspective-title', 'red-view', 'blue-view',
   'show-labels', 'map-overlay', 'overlay-title', 'overlay-text', 'hover-info', 'snapshot-age',
   'start-demo', 'demo-status', 'player-list', 'player-count', 'event-list',
-  'launch-btn', 'stop-btn', 'launch-mode', 'red-smart', 'red-jump', 'red-simple', 'blue-smart', 'blue-jump', 'blue-simple',
+  'launch-btn', 'stop-btn', 'launch-mode', 'red-smart', 'red-jump', 'red-simple', 'red-py', 'blue-smart', 'blue-jump', 'blue-simple', 'blue-py',
   'map-mode', 'map-obstacles', 'map-stands', 'map-seed'
 ].map(id => [id, document.getElementById(id)]));
 const colors = { left: '#f24d62', right: '#2689ee', spectator: '#8994a6' };
@@ -608,8 +608,8 @@ function readLaunchConfig() {
   const count = id => Math.max(0, Math.min(8, Number(elements[id].value) || 0));
   return {
     mode: elements['launch-mode'].value,
-    red: { smart: count('red-smart'), jump: count('red-jump'), simple: count('red-simple') },
-    blue: { smart: count('blue-smart'), jump: count('blue-jump'), simple: count('blue-simple') },
+    red: { smart: count('red-smart'), jump: count('red-jump'), simple: count('red-simple'), py: count('red-py') },
+    blue: { smart: count('blue-smart'), jump: count('blue-jump'), simple: count('blue-simple'), py: count('blue-py') },
     map: {
       mode: elements['map-mode'].value,
       obstacles: elements['map-obstacles'].value,
@@ -644,7 +644,7 @@ elements['stop-btn'].addEventListener('click', async () => {
 
 elements['launch-mode'].addEventListener('change', () => {
   const single = elements['launch-mode'].value === 'red';
-  for (const id of ['blue-smart', 'blue-jump', 'blue-simple']) elements[id].disabled = single;
+  for (const id of ['blue-smart', 'blue-jump', 'blue-simple', 'blue-py']) elements[id].disabled = single;
 });
 canvas.addEventListener('mousemove', event => {
   if (!geometry || !envelope.snapshot?.mapBuilt) return;

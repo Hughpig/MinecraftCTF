@@ -48,8 +48,9 @@ test('map extras compose overrides and skip defaults', () => {
 test('empty line-ups are rejected and specs are validated', () => {
   assert.throws(() => composeGroups({ mode: 'both', red: { smart: 0 }, blue: { smart: 0 }, map: {} }), /至少需要一名 bot/);
   assert.throws(() => parseTeamSpec('2:wizard'), /无效的队伍参数/);
-  assert.deepEqual(parseTeamSpec('2:smart, 1:simple'), { smart: 2, simple: 1, jump: 0 });
-  assert.deepEqual(parseTeamSpec('1:jump'), { smart: 0, simple: 0, jump: 1 });
+  assert.deepEqual(parseTeamSpec('2:smart, 1:simple'), { smart: 2, simple: 1, jump: 0, py: 0 });
+  assert.deepEqual(parseTeamSpec('1:jump'), { smart: 0, simple: 0, jump: 1, py: 0 });
+  assert.deepEqual(parseTeamSpec('1:py'), { smart: 0, simple: 0, jump: 0, py: 1 });
 });
 
 test('jump style spawns with the J prefix', () => {

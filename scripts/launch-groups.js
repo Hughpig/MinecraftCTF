@@ -5,18 +5,43 @@
 
 const path = require('node:path');
 
-const SCRIPTS = { smart: 'walk_smart_bot_test.js', simple: 'local_bot_test.js', jump: 'jump_smart_bot_test.js' };
-const STYLE_LETTERS = { smart: 'S', simple: 'X', jump: 'J' };
+const SCRIPTS = {
+  smart: { script: 'walk_smart_bot_test.js', runner: 'node' },
+  simple: { script: 'local_bot_test.js', runner: 'node' },
+  jump: { script: 'jump_smart_bot_test.js', runner: 'node' },
+  py: { script: 'python/ctf_bot.py', runner: 'python' }
+};
+const STYLE_LETTERS = { smart: 'S', simple: 'X', jump: 'J', py: 'P' };
 const STYLES = Object.keys(SCRIPTS);
+
+// Node styles run under the current node binary; the python style needs a
+// python interpreter — prefer `python`, fall back to the Windows launcher.
+function pythonCommand() {
+  for (const candidate of ['python', 'python3', 'py']) {
+    try {
+      const { execFileSync } = require('node:child_process');
+      execFileSync(candidate, ['--version'], { stdio: 'ignore' });
+      return candidate;
+    } catch (_) { /* try the next one */ }
+  }
+  throw new Error('未找到可用的 Python 解释器（python/python3/py），无法启动 py 风格 bot。');
+}
+
+function commandFor(style, root) {
+  const entry = SCRIPTS[style];
+  const script = require('node:path').join(root, 'bot-test', entry.script);
+  if (entry.runner === 'python') return { command: pythonCommand(), args: [script] };
+  return { command: process.execPath, args: [script] };
+}
 
 function parseTeamSpec(spec) {
   // "2:smart,1:simple,1:jump" -> {smart: 2, simple: 1, jump: 1}
-  const counts = { smart: 0, simple: 0, jump: 0 };
+  const counts = { smart: 0, simple: 0, jump: 0, py: 0 };
   for (const part of String(spec || '').split(',')) {
     const trimmed = part.trim();
     if (!trimmed) continue;
-    const match = trimmed.match(/^(\d+):(smart|simple|jump)$/i);
-    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|simple|jump，例如 2:smart,1:jump`);
+    const match = trimmed.match(/^(\d+):(smart|simple|jump|py)$/i);
+    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|jump|simple|py，例如 2:smart,1:py`);
     counts[match[2].toLowerCase()] += Number(match[1]);
   }
   return counts;
@@ -55,7 +80,8 @@ function composeGroups(config) {
         side,
         style,
         count,
-        script: SCRIPTS[style],
+        script: SCRIPTS[style].script,
+        runner: SCRIPTS[style].runner,
         label: `${side}-${style}`,
         env: {
           CTF_BOTS: String(count),
@@ -76,8 +102,7 @@ function composeGroups(config) {
 }
 
 function scriptPath(root, style) {
-  if (!SCRIPTS[style]) throw new Error(`未知的 bot 风格 ${style}`);
-  return path.join(root, 'bot-test', SCRIPTS[style]);
+  return commandFor(style, root).args[0];
 }
 
-module.exports = { SCRIPTS, STYLES, parseTeamSpec, composeGroups, composeMapExtra, scriptPath };
+module.exports = { SCRIPTS, STYLES, parseTeamSpec, composeGroups, composeMapExtra, scriptPath, commandFor, pythonCommand };

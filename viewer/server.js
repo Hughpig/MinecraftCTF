@@ -4,7 +4,7 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { composeGroups, scriptPath } = require('../scripts/launch-groups');
+const { composeGroups, commandFor } = require('../scripts/launch-groups');
 
 const port = Number(process.env.CTF_VIEWER_PORT || 3000);
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('CTF_VIEWER_PORT must be between 1024 and 65535');
@@ -43,7 +43,8 @@ function startLaunch(config) {
   let failed = 0;
   const collect = chunk => { output = (output + chunk.toString()).slice(-16000); };
   for (const group of groups) {
-    const child = spawn(process.execPath, [scriptPath(root, group.style)], {
+    const runner = commandFor(group.style, root);
+    const child = spawn(runner.command, runner.args, {
       cwd: path.join(root, 'bot-test'),
       windowsHide: true,
       env: { ...process.env, CTF_HOST: '127.0.0.1', CTF_PORT: '25565', ...group.env },

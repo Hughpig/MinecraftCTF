@@ -282,7 +282,7 @@ npm run launch -- --red 1:smart --enemy none
 npm run launch -- --red 3:jump --blue 3:smart --map random
 ```
 
-参数：`--red` / `--blue` 为 `数量:smart|jump|simple` 逗号分隔的混编列表；`--map fixed|random`；`--obstacles 0|fixed|random`；`--stands fixed|random`；`--seed 整数`；`--enemy none` 切换单队测试。固定阵营的 bot 使用 `RS_/RJ_/RX_/BS_/BJ_/BX_` 前缀用户名（红/蓝 × smart/jump/simple），同一局内的用户名互不冲突。
+参数：`--red` / `--blue` 为 `数量:smart|jump|simple|py` 逗号分隔的混编列表；`--map fixed|random`；`--obstacles 0|fixed|random`；`--stands fixed|random`；`--seed 整数`；`--enemy none` 切换单队测试。固定阵营的 bot 使用 `RS_/RJ_/RX_/RP_/BS_/BJ_/BX_/BP_` 前缀用户名（红/蓝 × smart/jump/simple/python），同一局内的用户名互不冲突。`py` 风格需要本机安装 Python 3.8+（启动器自动探测 `python`/`python3`/`py`）。
 
 bot 脚本可用的环境变量（启动器会自动设置，也可手动覆盖）：
 
@@ -313,6 +313,30 @@ walk-smart 额外的对抗行为：
 - **目标动态分配**：同队 bot 共享一张认领表（15 秒租约、被抓即释放），每次都认领"未被队友认领的最近活旗"，两 bot 不会追同一面旗而放空其余；目标全部有主时协助最近的；
 - **队友营救**：感知队友被抓后，最近的空闲 bot（携旗者除外）前往己方监狱压力板踩板开门，确认门开后回归岗位；30 秒计时开门同样能识别；
 - 防守/巡逻/追捕/逃逸行为与 walk-smart 相同。
+
+## 用 Python 开发 bot
+
+仓库自带一个零依赖的 Python 协议客户端（`bot-test/python/mc.py`），可直接连接本机 Paper 服务端（1.21.8，协议 772），覆盖离线登录、1.20.2+ 配置阶段、keep-alive、位置同步/确认、聊天收发（含最小 NBT 聊天解析）。`bot-test/python/ctf_bot.py` 是完整示例：多 bot 单进程多线程，行为对标根目录的 `ctf_bot.js`（找旗→走近→服务端自动拾旗→回金块插旗→监狱走出），可用启动器 `数量:py` 或面板的 python 输入框直接开赛。
+
+自己写 bot 时只需 `mc.py` 一个文件：
+
+```python
+import time
+from mc import MinecraftClient
+
+bot = MinecraftClient("127.0.0.1", 25565, "MyBot", on_chat=print)
+bot.start()
+while not bot.play_ready:
+    time.sleep(0.2)          # 等待进入游戏（位置同步完成）
+bot.send_chat("match team:red enemy:bot players:1 map:fixed")
+bot.send_chat("I'm ready!")
+while True:
+    bot.position.x += 0.16   # 直接步进位置，服务端负责拾旗/插旗/抓捕判定
+    bot.send_position()
+    time.sleep(0.1)
+```
+
+可用的 API：`on_chat`（聊天回调，服务端 [CTF] 消息与玩家聊天都已提取纯文本）、`send_chat`（聊天；以 `/` 开头自动走命令包）、`send_position` / `send_position_look` / `send_flying`（心跳）、`position`（服务端同步的当前坐标）、`play_ready`、`close()`。移动是包级直写（无物理模拟），游戏规则全部以服务端判定为准。
 
 ## 单队自由移动 viewer 测试
 

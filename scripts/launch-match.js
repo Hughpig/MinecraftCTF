@@ -7,7 +7,7 @@
 //   node scripts/launch-match.js --red 2:smart --enemy none
 const { spawn } = require('node:child_process');
 const path = require('node:path');
-const { composeGroups, parseTeamSpec, scriptPath } = require('./launch-groups');
+const { composeGroups, parseTeamSpec, commandFor } = require('./launch-groups');
 
 const root = path.resolve(__dirname, '..');
 const children = [];
@@ -62,7 +62,8 @@ try {
 
 for (const group of groups) {
   console.log(`[launch] ${group.label}: ${group.count} bot(s), env CTF_MATCH_EXTRA="${group.env.CTF_MATCH_EXTRA}"`);
-  const child = spawn(process.execPath, [scriptPath(root, group.style)], {
+  const runner = commandFor(group.style, root);
+  const child = spawn(runner.command, runner.args, {
     cwd: path.join(root, 'bot-test'),
     env: { ...process.env, ...group.env },
     stdio: ['ignore', 'pipe', 'pipe']

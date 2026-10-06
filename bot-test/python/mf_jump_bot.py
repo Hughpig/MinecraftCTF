@@ -83,6 +83,7 @@ class PyJumpBot:
         self.rescue_target = None
         self.flag_scan = (0.0, [])
         self._gold_id = None
+        self._goal_cells = None
         self.state_waiters = []
         self.wait_lock = threading.Lock()
         self.bot = BridgeBot(mineflayer, vec3, HOST, PORT, self.username,
@@ -117,6 +118,7 @@ class PyJumpBot:
             return
         log.info("%s %s", self.username, text)
         if "地图已生成：" in text or "地图已就绪：" in text:
+            self._goal_cells = None
             confirm_map_ready.set()
         if "Are you ready?" in text:
             self.bot.chat("I'm ready!")
@@ -359,8 +361,10 @@ class PyJumpBot:
         return self.bot.scan_enemy_banners(self.team)
 
     def is_banner_gone(self, cell):
-        positions = self.scan_enemy_banners()
-        return not any(abs(p["x"] - cell["x"]) < 0.6 and abs(p["z"] - cell["z"]) < 0.6 for p in positions)
+        # Cheap per-cell check: a picked-up flag leaves air behind. The old
+        # full-scan here blocked the Node physics loop every 700ms, which read
+        # as the bot "dashing then stopping" down the whole approach.
+        return self.bot.block_is_air(cell["x"], 64, cell["z"]) is True
 
     def prune_claims(self):
         with coordination_lock:
@@ -422,24 +426,31 @@ class PyJumpBot:
         return self.bot.block_is_air(goal["x"], 64, goal["z"]) is False
 
     def scan_home_goals(self):
-        if self._gold_id is None:
-            gold = self.bot.bot.registry.blocksByName["gold_block"]
-            self._gold_id = int(gold.id)
-        sign = self.home_sign()
-        goals = []
-        try:
-            found = self.bot.bot.findBlocks({
-                "matching": self._gold_id, "maxDistance": 96, "count": 32,
-            })
-        except Exception:
-            return goals
-        for p in found:
-            gx, gz = int(float(p.x)), int(float(p.z))
-            if gx * sign <= 1:
-                continue
-            if self.bot.block_is_air(gx, 64, gz) is True:
+        # Goal cells are fixed for the whole match: scan the gold blocks once,
+        # then per-poll only the cheap air-above check. Repeated findBlocks
+        # here froze the Node physics loop while the carrier ran home.
+        if self._goal_cells is not None:
+            goals = self._goal_cells
+        else:
+            if self._gold_id is None:
+                gold = self.bot.bot.registry.blocksByName["gold_block"]
+                self._gold_id = int(gold.id)
+            sign = self.home_sign()
+            goals = []
+            try:
+                found = self.bot.bot.findBlocks({
+                    "matching": self._gold_id, "maxDistance": 96, "count": 32,
+                })
+            except Exception:
+                return goals
+            for p in found:
+                gx, gz = int(float(p.x)), int(float(p.z))
+                if gx * sign <= 1:
+                    continue
                 goals.append({"x": gx, "z": gz})
-        return goals
+            if goals:
+                self._goal_cells = goals
+        return [g for g in goals if self.bot.block_is_air(g["x"], 64, g["z"]) is True]
 
     def wait_for_home_goal(self):
         started = time.time()

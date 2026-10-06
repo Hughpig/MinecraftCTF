@@ -17,6 +17,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from javascript import require  # noqa: E402
+import ctf_coord  # noqa: E402
 import ctf_steer  # noqa: E402
 from mf import BridgeBot  # noqa: E402
 
@@ -40,6 +41,7 @@ FLAG_ROWS = [-30, -22, -14, -6]
 
 CLAIM_LEASE_MS = 15000
 JAIL_ENTRY_TIMEOUT_S = 32.0
+RESCUE_LEASE_S = 25.0  # matches the plate walk + hold budget; stale epochs re-claim
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(message)s",
                     datefmt="%H:%M:%S")
@@ -51,9 +53,13 @@ stats = {"pickups": 0, "captures": 0, "route_failures": 0}
 stats_lock = threading.Lock()
 confirm_map_ready = threading.Event()
 
-# In-process team coordination: dynamic flag claims (short leases) and
-# jail/rescue bookkeeping — same design as the Node bots.
-coordination = {team: {"claims": {}, "jailed": {}, "rescuers": {}} for team in ("left", "right")}
+# Team coordination: dynamic flag claims (short leases) and jail/rescue
+# bookkeeping — shared across bot processes via the [CTFC] chat protocol and
+# mirrored by the Node bots. "rescue" is the cross-process epoch of the single
+# in-flight rescue; one plate press frees every prisoner, so one rescuer
+# covers the whole door.
+coordination = {team: {"claims": {}, "jailed": {}, "rescuers": {}, "rescue": None}
+                for team in ("left", "right")}
 coordination_lock = threading.RLock()
 
 
@@ -81,6 +87,7 @@ class PyJumpBot:
         self.captures_count = 0
         self.claimed_key = None
         self.rescue_target = None
+        self.rescue_stolen = False
         self.flag_scan = (0.0, [])
         self._gold_id = None
         self.state_waiters = []
@@ -117,6 +124,9 @@ class PyJumpBot:
             return
         log.info("%s %s", self.username, text)
         self.note_jail(text)
+        coord = ctf_coord.parse_coordination(text, self.username, self.teammates)
+        if coord:
+            self.apply_coordination(*coord)
         if "地图已生成：" in text or "地图已就绪：" in text:
             confirm_map_ready.set()
         if "Are you ready?" in text:
@@ -143,6 +153,10 @@ class PyJumpBot:
             self.notify_waiters()
         if "监禁结束" in text or "已获释" in text or "监狱门已打开" in text:
             self.jailed = False
+            # The door opens for the whole team at once and this release is
+            # invisible to other processes — tell them to drop their jail and
+            # rescue bookkeeping (a timer release has no rescuer to say it).
+            self.coord_chat(ctf_coord.freed_message())
             self.notify_waiters()
         if "Game over!" in text and self.started:
             with stats_lock:
@@ -163,6 +177,48 @@ class PyJumpBot:
             c["jailed"][who] = time.time()
             for key in [k for k, claim in c["claims"].items() if claim["by"] == who]:
                 c["claims"].pop(key, None)
+            # A jailed rescuer cannot reach the plate: their epoch is dead and
+            # someone else must be able to claim the rescue.
+            if c.get("rescue") and c["rescue"]["by"] == who:
+                c["rescue"] = None
+
+    # -- [CTFC] team chat -----------------------------------------------------
+
+    def coord_chat(self, message):
+        try:
+            self.bot.chat(f"{ctf_coord.CHAT_PREFIX} {message}")
+        except Exception:
+            pass
+
+    def _rescue_taken_over(self, c):
+        return self.rescue_stolen or bool(c.get("rescue") and c["rescue"]["by"] != self.username)
+
+    def apply_coordination(self, sender, command, arg):
+        """Mirror a teammate's [CTFC] line into the shared coordination state."""
+        if not self.team:
+            return
+        with coordination_lock:
+            c = coordination[self.team]
+            now = time.time()
+            if command == "c":
+                if arg not in c["claims"]:
+                    c["claims"][arg] = {"by": sender, "at": now}
+            elif command == "u":
+                claim = c["claims"].get(arg)
+                if claim and claim["by"] == sender:
+                    c["claims"].pop(arg, None)
+            elif command == "r":
+                if self.rescue_target and self.username < sender:
+                    return  # both claimed at once: the smaller name keeps it
+                if self.rescue_target:
+                    # A teammate with priority took the door over; drop this
+                    # walk instead of double-pressing the plate.
+                    self.rescue_stolen = True
+                    log.info("%s rescue of %s taken over by %s", self.username, self.rescue_target, sender)
+                c["rescue"] = {"by": sender, "at": now}
+            elif command == "f":
+                c["jailed"].clear()
+                c["rescue"] = None
 
     def on_game_start(self, payload):
         try:
@@ -380,32 +436,42 @@ class PyJumpBot:
                     c["claims"].pop(key, None)
 
     def claim_enemy_flag(self, positions):
+        own = self.position()
         with coordination_lock:
             self.prune_claims()
             c = coordination[self.team]
             sorted_positions = sorted(
-                positions, key=lambda p: (p["x"] - self.position()["x"]) ** 2 + (p["z"] - self.position()["z"]) ** 2)
+                positions, key=lambda p: (p["x"] - own["x"]) ** 2 + (p["z"] - own["z"]) ** 2)
             chosen = None
             for p in sorted_positions:
-                key = f"{p['x']},{p['z']}"
+                key = ctf_coord.claim_key(p["x"], p["z"])
                 if key not in c["claims"]:
                     c["claims"][key] = {"by": self.username, "at": time.time()}
                     chosen = p
                     break
             if not chosen:
                 chosen = sorted_positions[0]
-            self.claimed_key = f"{chosen['x']},{chosen['z']}"
-            return chosen
+            self.claimed_key = ctf_coord.claim_key(chosen["x"], chosen["z"])
+        # Cross-process share: teammates hear the claim and pick other banners
+        # until this lease expires.
+        self.coord_chat(ctf_coord.claim_message(self.claimed_key))
+        return chosen
 
     def release_claim(self):
         if not self.claimed_key:
             return
+        key = self.claimed_key
+        self.claimed_key = None
         with coordination_lock:
             c = coordination.get(self.team, {})
-            claim = c["claims"].get(self.claimed_key)
+            claim = c["claims"].get(key)
             if claim and claim["by"] == self.username:
-                c["claims"].pop(self.claimed_key, None)
-        self.claimed_key = None
+                c["claims"].pop(key, None)
+                released = True
+            else:
+                released = False
+        if released:
+            self.coord_chat(ctf_coord.unclaim_message(key))
 
     def wait_for_enemy_banner(self):
         started = time.time()
@@ -488,21 +554,37 @@ class PyJumpBot:
                 ent = self.entity_by_name(name)
                 if (ent and not is_in_prison_cell(ent)) or now - c["jailed"][name] > JAIL_ENTRY_TIMEOUT_S:
                     c["jailed"].pop(name, None)
+            rescue = c.get("rescue")
+            if rescue:
+                fresh = now - rescue["at"] < RESCUE_LEASE_S
+                alive = fresh and not c["jailed"].get(rescue["by"])
+                if not alive:
+                    c["rescue"] = None
+                elif rescue["by"] != self.username:
+                    return False  # a teammate process is already handling the door
             for jailed in c["jailed"]:
                 if jailed in c["rescuers"]:
                     continue
                 c["rescuers"][jailed] = self.username
                 self.rescue_target = jailed
-                return True
-            return False
+                c["rescue"] = {"by": self.username, "at": now}
+                claimed = jailed
+                break
+            else:
+                return False
+        self.coord_chat(ctf_coord.rescue_message(claimed))
+        return True
 
     def rescue_teammate(self):
         c = coordination[self.team]
         target = self.rescue_target
         plate = {"x": -15.5 if self.team == "left" else 16.5, "z": 24.5}
+        self.rescue_stolen = False
         log.info("%s rescuing %s: heading for the release plate", self.username, target)
         try:
             def arrived():
+                if self._rescue_taken_over(c) or not c["jailed"].get(target):
+                    return True
                 ent = self.entity_by_name(target)
                 return (ent and not is_in_prison_cell(ent)) or self.jailed
             self.go_near(plate["x"], plate["z"], completed=arrived, options={"maxDuration": 25})
@@ -511,9 +593,19 @@ class PyJumpBot:
             # and lingering here just blocks the doorway.
             deadline = time.time() + 20
             while not stopping and not self.jailed and time.time() < deadline:
-                if self.door_open():
-                    with coordination_lock:
-                        c["jailed"].pop(target, None)
+                door = self.door_open()
+                with coordination_lock:
+                    if door:
+                        # One plate press frees every prisoner of the team.
+                        c["jailed"].clear()
+                        if c.get("rescue") and c["rescue"]["by"] == self.username:
+                            c["rescue"] = None
+                    superseded = self._rescue_taken_over(c)
+                    already_freed = not c["jailed"].get(target) and not door
+                if door:
+                    self.coord_chat(ctf_coord.freed_message())
+                    break
+                if superseded or already_freed:
                     break
                 time.sleep(0.2)
             log.info("%s rescue finished for %s", self.username, target)
@@ -521,6 +613,8 @@ class PyJumpBot:
             with coordination_lock:
                 if target:
                     c["rescuers"].pop(target, None)
+                if c.get("rescue") and c["rescue"]["by"] == self.username:
+                    c["rescue"] = None
             self.rescue_target = None
 
     # -- combat / patrol -------------------------------------------------------

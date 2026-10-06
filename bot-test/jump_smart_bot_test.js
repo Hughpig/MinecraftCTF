@@ -5,6 +5,7 @@ const findArenaFlags = require('./arena-flag-search');
 const findArenaGoals = require('./arena-goal-search');
 const waitForInitialWorld = require('./startup-world');
 const { planSteer, strafeSideForAway, makeBlockProbe, nearestFreeCell } = require('./ctf-steer');
+const { CHAT_PREFIX, parseCoordination, claimKey, claimMessage, unclaimMessage, rescueMessage, freedMessage } = require('./ctf-coord');
 
 const HOST = process.env.CTF_HOST || '127.0.0.1';
 const PORT = Number(process.env.CTF_PORT || 25565);
@@ -33,14 +34,19 @@ const mapReady = new Promise(resolve => { confirmMapReady = resolve; });
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 const log = (name, message) => console.log(`[${new Date().toISOString()}] [${name}] ${message}`);
 
-// In-process team coordination shared by every bot this process controls:
-// dynamic flag claims (short leases so a stale claim cannot starve the team)
-// and jail/rescue bookkeeping for the plate rescue.
+// Team coordination shared by every bot this process controls: dynamic flag
+// claims (short leases so a stale claim cannot starve the team) and
+// jail/rescue bookkeeping for the plate rescue. Bot processes that never
+// share memory — including the Python jump bots — stay in sync through the
+// [CTFC] chat protocol (see ctf-coord.js). "rescue" is the cross-process
+// epoch of the single in-flight rescue: one plate press frees every prisoner,
+// so one rescuer covers the whole door.
 const CLAIM_LEASE_MS = 15000;
 const JAIL_ENTRY_TIMEOUT_MS = 32000; // past 30s the timer opens the door anyway
+const RESCUE_LEASE_MS = 25000;       // matches the plate walk + hold budget
 const teamCoordination = {};
 for (const team of ['left', 'right']) {
-  teamCoordination[team] = { claims: new Map(), jailed: new Map(), rescuers: new Map() };
+  teamCoordination[team] = { claims: new Map(), jailed: new Map(), rescuers: new Map(), rescue: null };
 }
 
 function pruneClaims(team, now) {
@@ -56,7 +62,7 @@ function claimEnemyFlag(bot, positions) {
   const sorted = [...positions].sort((a, b) => a.distanceSquared(bot.entity.position) - b.distanceSquared(bot.entity.position));
   let chosen = null;
   for (const p of sorted) {
-    const key = `${p.x},${p.z}`;
+    const key = claimKey(p.x, p.z);
     if (!c.claims.has(key)) {
       c.claims.set(key, { by: bot.username, at: Date.now() });
       chosen = p;
@@ -65,16 +71,23 @@ function claimEnemyFlag(bot, positions) {
   }
   // More carriers than free banners: assist the nearest claim instead of idling.
   if (!chosen) chosen = sorted[0];
-  bot.ctf.claimedKey = `${chosen.x},${chosen.z}`;
+  bot.ctf.claimedKey = claimKey(chosen.x, chosen.z);
+  // Cross-process share: teammates hear the claim and pick other banners
+  // until this lease expires.
+  bot.chat(`${CHAT_PREFIX} ${claimMessage(bot.ctf.claimedKey)}`);
   return chosen;
 }
 
 function releaseClaim(bot) {
   if (!bot.ctf.claimedKey) return;
-  const c = teamCoordination[bot.ctf.team];
-  const claim = c && c.claims.get(bot.ctf.claimedKey);
-  if (claim && claim.by === bot.username) c.claims.delete(bot.ctf.claimedKey);
+  const key = bot.ctf.claimedKey;
   bot.ctf.claimedKey = null;
+  const c = teamCoordination[bot.ctf.team];
+  const claim = c && c.claims.get(key);
+  if (claim && claim.by === bot.username) {
+    c.claims.delete(key);
+    bot.chat(`${CHAT_PREFIX} ${unclaimMessage(key)}`);
+  }
 }
 
 function noteJail(bot, message) {
@@ -86,6 +99,38 @@ function noteJail(bot, message) {
   c.jailed.set(who, Date.now());
   // A jailed carrier drops its flag somewhere else: its claims mean nothing now.
   for (const [key, claim] of c.claims) if (claim.by === who) c.claims.delete(key);
+  // A jailed rescuer cannot reach the plate: their epoch is dead and someone
+  // else must be able to claim the rescue.
+  if (c.rescue && c.rescue.by === who) c.rescue = null;
+}
+
+// Mirror a teammate's [CTFC] line into the shared coordination state.
+function applyCoordination(bot, { sender, command, arg }) {
+  if (!bot.ctf.team) return;
+  const c = teamCoordination[bot.ctf.team];
+  const now = Date.now();
+  if (command === 'c') {
+    if (!c.claims.has(arg)) c.claims.set(arg, { by: sender, at: now });
+  } else if (command === 'u') {
+    const claim = c.claims.get(arg);
+    if (claim && claim.by === sender) c.claims.delete(arg);
+  } else if (command === 'r') {
+    if (bot.ctf.rescueTarget && bot.username < sender) return; // smaller name keeps it
+    if (bot.ctf.rescueTarget) {
+      // A teammate with priority took the door over; drop this walk instead
+      // of double-pressing the plate.
+      bot.ctf.rescueStolen = true;
+      log(bot.username, `rescue of ${bot.ctf.rescueTarget} taken over by ${sender}`);
+    }
+    c.rescue = { by: sender, at: now };
+  } else if (command === 'f') {
+    c.jailed.clear();
+    c.rescue = null;
+  }
+}
+
+function rescueTakenOver(bot, c) {
+  return !!bot.ctf.rescueStolen || !!(c.rescue && c.rescue.by !== bot.username);
 }
 
 function prisonPlateFor(bot) {
@@ -117,10 +162,20 @@ function maybeClaimRescue(bot) {
       c.jailed.delete(name);
     }
   }
+  // One in-flight rescue per team across processes: a fresh claim by a
+  // teammate who is not themselves jailed covers the whole door.
+  if (c.rescue) {
+    const alive = Date.now() - c.rescue.at < RESCUE_LEASE_MS && !c.jailed.has(c.rescue.by);
+    if (!alive) c.rescue = null;
+    else if (c.rescue.by !== bot.username) return false;
+  }
   for (const jailed of c.jailed.keys()) {
     if (c.rescuers.has(jailed)) continue;
     c.rescuers.set(jailed, bot.username);
     bot.ctf.rescueTarget = jailed;
+    bot.ctf.rescueStolen = false;
+    c.rescue = { by: bot.username, at: Date.now() };
+    bot.chat(`${CHAT_PREFIX} ${rescueMessage(jailed)}`);
     return true;
   }
   return false;
@@ -130,9 +185,11 @@ async function rescueTeammate(bot) {
   const c = teamCoordination[bot.ctf.team];
   const target = bot.ctf.rescueTarget;
   const plate = prisonPlateFor(bot);
+  bot.ctf.rescueStolen = false;
   log(bot.username, `rescuing ${target}: heading for the release plate`);
   try {
     await goNear(bot, plate.x, plate.z, () => {
+      if (rescueTakenOver(bot, c) || !c.jailed.has(target)) return true;
       const ent = entityByUsername(bot, target);
       return (!!ent && !isInPrisonCell(ent.position)) || bot.ctf.jailed;
     }, { maxDuration: 25000 });
@@ -143,12 +200,20 @@ async function rescueTeammate(bot) {
     const deadline = Date.now() + 15000;
     while (!stopping && !bot.ctf.jailed && Date.now() < deadline) {
       const ent = entityByUsername(bot, target);
-      if (ent && !isInPrisonCell(ent.position)) { c.jailed.delete(target); break; }
+      if (ent && !isInPrisonCell(ent.position)) {
+        // One press frees every prisoner of the team.
+        c.jailed.clear();
+        if (c.rescue && c.rescue.by === bot.username) c.rescue = null;
+        bot.chat(`${CHAT_PREFIX} ${freedMessage()}`);
+        break;
+      }
+      if (rescueTakenOver(bot, c) || !c.jailed.has(target)) break;
       await sleep(200);
     }
     log(bot.username, `rescue finished for ${target}`);
   } finally {
     if (target) c.rescuers.delete(target);
+    if (c.rescue && c.rescue.by === bot.username) c.rescue = null;
     bot.ctf.rescueTarget = null;
   }
 }
@@ -156,7 +221,7 @@ async function rescueTeammate(bot) {
 function makeBot(index) {
   const username = `${NAME_PREFIX}_${index + 1}`;
   const bot = mineflayer.createBot({ host: HOST, port: PORT, username, auth: 'offline', version: '1.21.8', viewDistance: VIEW_DISTANCE });
-  bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, pickups: 0, captures: 0, opponents: new Set() };
+  bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, rescueTarget: null, rescueStolen: false, claimedKey: null, pickups: 0, captures: 0, opponents: new Set() };
 
   bot.once('spawn', () => {
     log(username, `connected to ${HOST}:${PORT}`);
@@ -165,6 +230,8 @@ function makeBot(index) {
   bot.on('messagestr', message => {
     log(username, message);
     noteJail(bot, message);
+    const coord = parseCoordination(message, username, bot.ctf.teammates);
+    if (coord) applyCoordination(bot, coord);
     if (message.includes('地图已生成：') || message.includes('地图已就绪：')) {
       confirmMapReady();
     }
@@ -206,7 +273,13 @@ function makeBot(index) {
     if (message.includes(`${username} 被抓捕并关入`) || (message.includes('你被 ') && message.includes('抓捕，监禁'))) {
       bot.ctf.jailed = true;
     }
-    if (message.includes('监禁结束') || message.includes('已获释') || message.includes('监狱门已打开')) bot.ctf.jailed = false;
+    if (message.includes('监禁结束') || message.includes('已获释') || message.includes('监狱门已打开')) {
+      bot.ctf.jailed = false;
+      // The door opens for the whole team at once and this release is
+      // invisible to other processes — tell them to drop their jail and
+      // rescue bookkeeping (a timer release has no rescuer to say it).
+      bot.chat(`${CHAT_PREFIX} ${freedMessage()}`);
+    }
     if (message.includes('Game over!') && bot.ctf.started) {
       gameEnded = true;
       if (!finishTimer) finishTimer = setTimeout(stopAll, 200);

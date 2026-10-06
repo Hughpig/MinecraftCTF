@@ -15,6 +15,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mc import MinecraftClient  # noqa: E402
+import ctf_steer  # noqa: E402
 
 HOST = os.environ.get("CTF_HOST", "127.0.0.1")
 PORT = int(os.environ.get("CTF_PORT", "25565"))
@@ -30,9 +31,11 @@ SEND_SETUP = os.environ.get("CTF_SETUP", "1") != "0"
 MATCH = f"match team:{NAME_PREFIX.lower()} enemy:{ENEMY} players:{PLAYERS_PER_TEAM} map:{MAP_MODE}"
 if MATCH_EXTRA:
     MATCH += " " + MATCH_EXTRA
+SNAPSHOT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "..", "..", "server", "plugins", "MinecraftCTF", "viewer-state.json")
 
 CONTROL_INTERVAL = 0.1
-STEP_DISTANCE = 0.16
+STEP_DISTANCE = 0.5
 FLAG_ROWS = [-30, -22, -14, -6]
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(name)s] %(message)s",
@@ -148,10 +151,18 @@ class CtfBot:
 
     # -- movement ------------------------------------------------------------
 
+    def tree_cells(self):
+        """Obstacle cells from the server snapshot (3x3 tree footprints)."""
+        state = self._read_snapshot()
+        if not state:
+            return set()
+        return {f"{b['x']},{b['z']}" for b in state.get("blocks", []) if b.get("kind") == "tree"}
+
     def move_to(self, target, tolerance=0.85, max_seconds=20.0):
         started = time.time()
         last_progress = started
         last_distance = float("inf")
+        detour = None
         while not self.stopped and not self.jailed:
             position = self.client.position
             dx = target["x"] - position.x
@@ -161,9 +172,26 @@ class CtfBot:
                 return True
             if time.time() - started > max_seconds or time.time() - last_progress > 3.0:
                 return False
+            # Steer around 3x3 trees (protocol bots cannot jump them): the tree
+            # cells come from the server snapshot, the detour math from
+            # ctf_steer — the same algorithm the mineflayer bots use.
+            trees = self.tree_cells()
+            if trees:
+                def probe(x, z, level):
+                    return f"{x},{z}" in trees
+                steer = ctf_steer.plan_steer(
+                    {"x": position.x, "z": position.z}, {"x": target["x"], "z": target["z"]},
+                    detour, probe)
+                detour = steer["detour"]
+                steer_point = steer["steer_point"]
+            else:
+                steer_point = {"x": target["x"], "z": target["z"]}
+            sdx = steer_point["x"] - position.x
+            sdz = steer_point["z"] - position.z
+            steer_len = max((sdx * sdx + sdz * sdz) ** 0.5, 0.01)
             step = min(STEP_DISTANCE, distance)
-            position.x += dx / max(distance, 0.01) * step
-            position.z += dz / max(distance, 0.01) * step
+            position.x += sdx / steer_len * step
+            position.z += sdz / steer_len * step
             self.client.send_position()
             if distance < last_distance - 0.1:
                 last_distance = distance
@@ -178,15 +206,44 @@ class CtfBot:
         side = -20 <= position.x <= -12 if self.team == "left" else 12 <= position.x <= 20
         return side and 24 <= position.z <= 32
 
+    @staticmethod
+    def _read_snapshot():
+        # Local demo convenience: the server's authoritative snapshot sits on
+        # the same machine, and the protocol client does not parse chunk data —
+        # without it, random stand layouts leave this bot walking between empty
+        # legacy coordinates.
+        try:
+            with open(SNAPSHOT_PATH, encoding="utf-8") as handle:
+                state = json.load(handle)
+            if state.get("mapBuilt") and state.get("phase") in ("running", "finished"):
+                return state
+        except (OSError, json.JSONDecodeError):
+            pass
+        return None
+
     def enemy_flags(self):
+        state = self._read_snapshot()
+        if state:
+            enemy = "right" if self.team == "left" else "left"
+            live = [{"x": f["x"] - 0.5, "z": f["z"] + 0.5}
+                    for f in state.get("flags", [])
+                    if f["team"] == enemy and f.get("status") == "available"]
+            if live:
+                return live
         sign = 1 if self.team == "left" else -1
-        return [{"x": sign * (column - 1), "z": z} for column in (18, 10) for z in FLAG_ROWS]
+        return [{"x": sign * (column - 1) - 0.5 * sign, "z": z} for column in (18, 10) for z in FLAG_ROWS]
 
     def home_targets(self):
+        state = self._read_snapshot()
+        if state:
+            live = [{"x": t["x"] + 0.5, "z": t["z"] + 0.5}
+                    for t in state.get("targets", [])
+                    if t["team"] == self.team and not t.get("locked")]
+            if live:
+                return live
         sign = -1 if self.team == "left" else 1
-        # Aim at the gold block centre (legacy goals sit at ±4/±7): the deposit
-        # check needs 1.58 blocks from the block corner, and stopping 0.85 short
-        # of the corner misses it by ~0.3.
+        # Legacy goals sit at ±4/±7; aim at the gold block centre so the 1.58
+        # block deposit check (including +1 for standing on it) is reachable.
         return [{"x": sign * column - 0.5 * sign, "z": z} for column in (4, 7) for z in FLAG_ROWS]
 
     @staticmethod
@@ -200,6 +257,13 @@ class CtfBot:
             return
         self.running = True
         time.sleep(2.5)
+        def trace():
+            while not self.stopped:
+                p = self.client.position
+                log.info("%s pos=(%.1f,%.1f) carrying=%s jailed=%s",
+                         self.username, p.x, p.z, self.carrying, self.jailed)
+                time.sleep(5)
+        threading.Thread(target=trace, name="trace-" + self.username, daemon=True).start()
         side_index = int("".join(ch for ch in self.username if ch.isdigit()) or 0)
         route = self.enemy_flags()[self.index % 3::3]
         while not self.stopped:
@@ -219,9 +283,8 @@ class CtfBot:
                 time.sleep(0.15)
                 continue
             target = self.nearest(self.home_targets(), self.client.position)
-            # Tight approach: the deposit check is 1.58 blocks from the gold
-            # corner including +1.0 for standing on it, so stop 0.3 from the
-            # block centre (the bot walks onto the block itself).
+            # Tight approach when aiming at a gold block centre; the snapshot
+            # goals are already block-centred so 0.3 works for both paths.
             if not self.move_to(target, tolerance=0.3):
                 continue
             self.wait_for(lambda: not self.carrying, 2.5)

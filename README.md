@@ -282,7 +282,7 @@ npm run launch -- --red 1:smart --enemy none
 npm run launch -- --red 3:jump --blue 3:smart --map random
 ```
 
-参数：`--red` / `--blue` 为 `数量:smart|jump|simple|py` 逗号分隔的混编列表；`--map fixed|random`；`--obstacles 0|fixed|random`；`--stands fixed|random`；`--seed 整数`；`--enemy none` 切换单队测试。固定阵营的 bot 使用 `RS_/RJ_/RX_/RP_/BS_/BJ_/BX_/BP_` 前缀用户名（红/蓝 × smart/jump/simple/python），同一局内的用户名互不冲突。`py` 风格需要本机安装 Python 3.8+（启动器自动探测 `python`/`python3`/`py`）。
+参数：`--red` / `--blue` 为 `数量:smart|jump|simple|py|pyjump` 逗号分隔的混编列表；`--map fixed|random`；`--obstacles 0|fixed|random`；`--stands fixed|random`；`--seed 整数`；`--enemy none` 切换单队测试。固定阵营的 bot 使用 `RS_/RJ_/RX_/RP_/RY_/BS_/BJ_/BX_/BP_/BY_` 前缀用户名（红/蓝 × smart/jump/simple/python/py-jump），同一局内的用户名互不冲突。`py` 风格需要本机安装 Python 3.8+（启动器自动探测 `python`/`python3`/`py`）；`pyjump` 风格首次使用自动创建 venv。
 
 bot 脚本可用的环境变量（启动器会自动设置，也可手动覆盖）：
 
@@ -313,6 +313,26 @@ walk-smart 额外的对抗行为：
 - **目标动态分配**：同队 bot 共享一张认领表（15 秒租约、被抓即释放），每次都认领"未被队友认领的最近活旗"，两 bot 不会追同一面旗而放空其余；目标全部有主时协助最近的；
 - **队友营救**：感知队友被抓后，最近的空闲 bot（携旗者除外）前往己方监狱压力板踩板开门，确认门开后回归岗位；30 秒计时开门同样能识别；
 - 防守/巡逻/追捕/逃逸行为与 walk-smart 相同。
+
+### py-jump（Python + JSPyBridge）
+
+`数量:pyjump`（用户名前缀 `RY_/BY_`）。与 jump-smart **能力对齐**的 Python 版本：通过 JSPyBridge 在 Python 里驱动完整的 mineflayer（真实物理、方块、实体），移植了 jump-smart 的疾跑跳跃移动、`ctf-steer` 绕障、躲人、己方抓捕、动态认领和压力板营救。与 `py`（零依赖协议级）的区别：
+
+| | `py`（协议级） | `pyjump`（桥接） |
+| --- | --- | --- |
+| 依赖 | 无 | venv + `pip install javascript`（首次自动引导） |
+| 移动 | 位置包直写 1.6 格/s | mineflayer 物理，疾跑+跳跃 |
+| 能力 | 走固定路线 | 与 jump-smart 相同的完整行为 |
+
+首次使用会自动创建 `bot-test/python/.venv` 并安装桥接包；也可手动：
+
+```powershell
+cd bot-test/python
+python -m venv .venv
+.venv\Scripts\python -m pip install javascript
+```
+
+桥接调用的开销约 0.1–0.9 ms/次，热路径（方块探针、位置读取）在 `mf.py` 里都有 Python 侧缓存。编写自己的桥接 bot 参考 `mf.py` 的封装与 `mf_jump_bot.py` 的行为层。
 
 ## 用 Python 开发 bot
 

@@ -9,9 +9,10 @@ const SCRIPTS = {
   smart: { script: 'walk_smart_bot_test.js', runner: 'node' },
   simple: { script: 'local_bot_test.js', runner: 'node' },
   jump: { script: 'jump_smart_bot_test.js', runner: 'node' },
-  py: { script: 'python/ctf_bot.py', runner: 'python' }
+  py: { script: 'python/ctf_bot.py', runner: 'python' },
+  pyjump: { script: 'python/mf_jump_bot.py', runner: 'python-bridge' }
 };
-const STYLE_LETTERS = { smart: 'S', simple: 'X', jump: 'J', py: 'P' };
+const STYLE_LETTERS = { smart: 'S', simple: 'X', jump: 'J', py: 'P', pyjump: 'Y' };
 const STYLES = Object.keys(SCRIPTS);
 
 // Node styles run under the current node binary; the python style needs a
@@ -27,21 +28,39 @@ function pythonCommand() {
   throw new Error('未找到可用的 Python 解释器（python/python3/py），无法启动 py 风格 bot。');
 }
 
+// The JSPyBridge style (pyjump) needs a venv with the `javascript` package;
+// bootstrap bot-test/python/.venv on first use, then reuse it.
+function pybridgeCommand(root) {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const venvDir = path.join(root, 'bot-test', 'python', '.venv');
+  const python = pythonCommand();
+  const venvPython = path.join(venvDir, process.platform === 'win32' ? 'Scripts\\python.exe' : 'bin/python');
+  if (!fs.existsSync(venvPython)) {
+    const { execFileSync } = require('node:child_process');
+    console.error('[pybridge] 首次使用：正在创建 venv 并安装 JSPyBridge（需要几分钟）…');
+    execFileSync(python, ['-m', 'venv', venvDir], { stdio: 'inherit' });
+    execFileSync(venvPython, ['-m', 'pip', 'install', '--quiet', 'javascript'], { stdio: 'inherit' });
+  }
+  return venvPython;
+}
+
 function commandFor(style, root) {
   const entry = SCRIPTS[style];
   const script = require('node:path').join(root, 'bot-test', entry.script);
   if (entry.runner === 'python') return { command: pythonCommand(), args: [script] };
+  if (entry.runner === 'python-bridge') return { command: pybridgeCommand(root), args: [script] };
   return { command: process.execPath, args: [script] };
 }
 
 function parseTeamSpec(spec) {
   // "2:smart,1:simple,1:jump" -> {smart: 2, simple: 1, jump: 1}
-  const counts = { smart: 0, simple: 0, jump: 0, py: 0 };
+  const counts = { smart: 0, simple: 0, jump: 0, py: 0, pyjump: 0 };
   for (const part of String(spec || '').split(',')) {
     const trimmed = part.trim();
     if (!trimmed) continue;
-    const match = trimmed.match(/^(\d+):(smart|simple|jump|py)$/i);
-    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|jump|simple|py，例如 2:smart,1:py`);
+    const match = trimmed.match(/^(\d+):(smart|simple|jump|py|pyjump)$/i);
+    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|jump|simple|py|pyjump，例如 2:smart,1:pyjump`);
     counts[match[2].toLowerCase()] += Number(match[1]);
   }
   return counts;

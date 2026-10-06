@@ -426,6 +426,22 @@ class PyJumpBot:
 
     # -- goals ---------------------------------------------------------------
 
+    def door_open(self):
+        """Own prison door state: an open door lets the teammate walk out."""
+        door_x = -16 if self.team == "left" else 16
+        try:
+            block = self.bot.bot.blockAt(self.bot.vec3(door_x, 64, 26))
+            if block is None:
+                return False
+            # prismarine-block exposes states only through getProperties();
+            # there is no `properties` field, so the old read always saw None
+            # and rescuers stood out the whole 20s hold after the door opened.
+            properties = block.getProperties()
+            open_state = properties.open if properties else None
+            return open_state is True or open_state == "true"
+        except Exception:
+            return False
+
     def is_goal_locked(self, goal):
         return self.bot.block_is_air(goal["x"], 64, goal["z"]) is False
 
@@ -490,10 +506,12 @@ class PyJumpBot:
                 ent = self.entity_by_name(target)
                 return (ent and not is_in_prison_cell(ent)) or self.jailed
             self.go_near(plate["x"], plate["z"], completed=arrived, options={"maxDuration": 25})
-            deadline = time.time() + 15
+            # Hold the plate until the door opens, then LEAVE immediately —
+            # the freed teammate walks out through the open door themselves,
+            # and lingering here just blocks the doorway.
+            deadline = time.time() + 20
             while not stopping and not self.jailed and time.time() < deadline:
-                ent = self.entity_by_name(target)
-                if ent and not is_in_prison_cell(ent):
+                if self.door_open():
                     with coordination_lock:
                         c["jailed"].pop(target, None)
                     break

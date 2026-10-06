@@ -16,7 +16,11 @@ function makeBlockProbe(bot) {
     const block = bot.blockAt(new Vec3(x, 64 + level, z));
     if (!block || block.boundingBox !== 'block') return false;
     if (DOORS.has(block.name)) {
-      const open = block.properties ? block.properties.open : undefined;
+      // prismarine-block only exposes states via getProperties(); there is no
+      // `properties` field, so the old read always saw undefined and open
+      // doors stayed "solid" to the probe.
+      const props = typeof block.getProperties === 'function' ? block.getProperties() : block.properties;
+      const open = props ? props.open : undefined;
       if (open === true || open === 'true') return false;
     }
     return true;

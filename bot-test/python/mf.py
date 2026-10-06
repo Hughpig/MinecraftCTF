@@ -129,7 +129,10 @@ class BridgeBot:
                 solid = True
                 name = str(block.name)
                 if name.endswith(DOOR_SUFFIX):
-                    properties = block.properties
+                    # prismarine-block exposes states only through
+                    # getProperties(); `block.properties` does not exist, so
+                    # open doors used to stay "solid" here.
+                    properties = self._block_properties(block)
                     open_state = properties.open if properties else None
                     if open_state is True or open_state == "true":
                         solid = False
@@ -156,6 +159,13 @@ class BridgeBot:
             log.exception("banner scan failed")
         self._scan_cache = (now, positions)
         return positions
+
+    @staticmethod
+    def _block_properties(block):
+        try:
+            return block.getProperties()
+        except Exception:
+            return None
 
     def block_is_air(self, x, y, z):
         """True when the block is air; None means unknown (chunk not loaded)."""

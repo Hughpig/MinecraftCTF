@@ -455,12 +455,11 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
             match.prisonTeam.remove(id);
             match.jailedUntil.remove(id);
             if (player != null) {
-                // Deterministic exit: walking out can wedge behind the one-block
-                // door (a fresh jail re-closes it, and door-block physics can
-                // stall clients), so place the player just outside their own
-                // door instead of hoping they path out.
-                player.teleport(map.prisonExit(team));
-                player.sendMessage(Component.text("监狱门已打开，你已获释并被送出监狱。"));
+                // Walk-out release: the door stays open until the next jail and
+                // the plate keeps working, so the prisoner paths out the doorway.
+                // The bots ride out a freshly re-closed door with their retry
+                // loop; the 30s timer is the backstop for everyone else.
+                player.sendMessage(Component.text("监狱门已打开，你已获释。"));
                 event("release", Map.of("player", player.getName(), "reason", reason));
             }
         }
@@ -1084,7 +1083,6 @@ public final class CtfPlugin extends JavaPlugin implements Listener {
         boolean isHomeHalf(Team t, Location l){return t==Team.LEFT?l.getX()<0:l.getX()>0;} boolean isEnemyHalf(Team t, Location l){return !isHomeHalf(t,l) && Math.abs(l.getX())>1;}
         Location spawn(Team t){return new Location(world,t==Team.LEFT?-12:12,64,0.5, (float)(t==Team.LEFT?Math.PI/2:-Math.PI/2),0);}
         Location prison(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,28.5,180,0);}
-        Location prisonExit(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,23.5,180,0);}
         Location prisonDoor(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,26.5);}
         Location prisonPlate(Team team){return new Location(world,team==Team.LEFT?-15.5:16.5,64,24.5);}
         Location lobby(){return new Location(world,0,64,0.5);}

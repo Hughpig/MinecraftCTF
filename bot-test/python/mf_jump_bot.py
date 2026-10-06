@@ -116,6 +116,7 @@ class PyJumpBot:
         if not text:
             return
         log.info("%s %s", self.username, text)
+        self.note_jail(text)
         if "地图已生成：" in text or "地图已就绪：" in text:
             confirm_map_ready.set()
         if "Are you ready?" in text:
@@ -139,7 +140,6 @@ class PyJumpBot:
         if (f"{self.username} 被抓捕并关入" in text) or ("你被 " in text and "抓捕，监禁" in text):
             self.carrying = False
             self.jailed = True
-            self.note_jail(text)
             self.notify_waiters()
         if "监禁结束" in text or "已获释" in text or "监狱门已打开" in text:
             self.jailed = False
@@ -260,15 +260,22 @@ class PyJumpBot:
         stall_count = 0
         unstick_until = 0.0
         unstick_point = None
+        was_jailed = False
         while not stopping and time.time() - started < max_duration:
             if completed():
                 self.bot.clear_controls()
                 return True
             if self.jailed:
+                was_jailed = True
                 self.bot.clear_controls()
                 time.sleep(0.25)
                 started = time.time()
                 continue
+            if was_jailed:
+                # Released while this leg was running: abort so the route
+                # re-runs leave_prison instead of grinding at the cell bars.
+                self.bot.clear_controls()
+                raise RuntimeError("released from prison mid-leg")
             position = self.position()
             dx = target["x"] - position["x"]
             dz = target["z"] - position["z"]
@@ -666,9 +673,10 @@ def stop_all():
         passed = stats.get("game_ended", False) and stats["pickups"] > 0 and stats["captures"] > 0
         failures = sum(1 for bot in bots if bot.route_failed)
     process_passed = passed
-    log.info("smoke %s: pickups=%d, captures=%d, routeFailures=%d, gameEnded=%s",
-             "PASS" if process_passed else "FAIL", stats["pickups"], stats["captures"],
-             failures, bool(stats.get("game_ended")))
+    # The launcher/viewer extract lines containing "[smoke]" — keep the format.
+    print(f"[smoke] {'PASS' if process_passed else 'FAIL'}: pickups={stats['pickups']}, "
+          f"captures={stats['captures']}, routeFailures={failures}, gameEnded={bool(stats.get('game_ended'))}",
+          flush=True)
     global exit_code
     exit_code = 0 if process_passed else 1
     for bot in bots:

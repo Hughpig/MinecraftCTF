@@ -107,16 +107,24 @@ async function goNear(bot, x, z, completed = () => false, options = {}) {
   let stallCount = 0;
   let unstickUntil = 0;
   let unstickPoint = null;
+  let wasJailed = false;
   const maxDuration = options.maxDuration || 20000;
   const target = new Vec3(x, 64, z);
   const probe = makeBlockProbe(bot);
   while (!stopping && Date.now() - started < maxDuration) {
     if (completed()) { bot.clearControlStates(); return true; }
     if (bot.ctf.jailed) {
+      wasJailed = true;
       bot.clearControlStates();
       await sleep(250);
       started = Date.now();
       continue;
+    }
+    if (wasJailed) {
+      // Released while this leg was running: abort so the route re-runs
+      // leavePrison instead of grinding at the cell bars.
+      bot.clearControlStates();
+      throw new Error('released from prison mid-leg');
     }
     if (!bot.entity) { await sleep(100); continue; }
     const position = bot.entity.position;

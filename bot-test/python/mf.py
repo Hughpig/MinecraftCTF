@@ -52,7 +52,9 @@ class BridgeBot:
         self.spawned = False
         self.play_ready = False
         self.connected = False
-        self.entities = {}      # username -> entity proxy (tracked players)
+        # Player entities are read directly from bot.players (mineflayer keeps
+        # it per-username); entitySpawn events never deliver OTHER players
+        # through the bridge, so event-based tracking was always empty.
         self._scan_cache = (0.0, [])          # banner scan (at, positions)
         self.scans = ARENA_SCANS
         self._probe_cache = {}                # (x, z, level) -> (solid, at)
@@ -65,8 +67,6 @@ class BridgeBot:
         bot = self.bot
         bot.once("spawn", safe(lambda *a: self._on_spawn()))
         bot.on("messagestr", safe(lambda *a: self.on_chat(str(a[0]) if a else "")))
-        bot.on("entitySpawn", safe(lambda *a: self._on_entity(a[0] if a else None)))
-        bot.on("entityGone", safe(lambda *a: self._on_entity_gone(a[0] if a else None)))
         bot.on("kicked", safe(lambda *a: log.info("[%s] kicked: %s", username, a)))
         bot.on("error", safe(lambda *a: log.info("[%s] error: %s", username, a)))
         bot.on("end", safe(lambda *a: self._on_end(a)))
@@ -85,20 +85,6 @@ class BridgeBot:
         self.connected = False
         self.on_end(str(args[0]) if args else "disconnected")
 
-    def _on_entity(self, entity):
-        if entity is None:
-            return
-        username = str(entity.username) if entity.username else None
-        if username and username != self.username:
-            self.entities[username] = entity
-
-    def _on_entity_gone(self, entity):
-        if entity is None:
-            return
-        username = str(entity.username) if entity.username else None
-        if username:
-            self.entities.pop(username, None)
-
     def quit(self, reason):
         try:
             self.bot.quit(reason)
@@ -116,11 +102,12 @@ class BridgeBot:
         return dict(self.position)
 
     def entity_position(self, username):
-        """Cached-entity read: (x, z) of a tracked player or None."""
-        entity = self.entities.get(username)
-        if not entity:
-            return None
+        """Live read: a player's position from bot.players, or None when the
+        player is out of range/not spawned."""
         try:
+            entity = self.bot.players[username].entity
+            if not entity:
+                return None
             position = entity.position
             return {"x": float(position.x), "z": float(position.z), "y": float(position.y)}
         except Exception:

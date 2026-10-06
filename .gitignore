@@ -64,3 +64,6 @@ server/version_history.json
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Python venv (JSPyBridge experiments)
+bot-test/python/.venv/

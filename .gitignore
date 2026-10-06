@@ -60,3 +60,7 @@ server/version_history.json
 
 # ZCode session artifacts
 .zcode/
+
+# Python bytecode
+__pycache__/
+*.pyc

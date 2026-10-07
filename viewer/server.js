@@ -42,6 +42,11 @@ function startLaunch(config) {
   let closed = 0;
   let failed = 0;
   const collect = chunk => { output = (output + chunk.toString()).slice(-16000); };
+  // Per-match bot logs: the in-memory collect only keeps the tail for the
+  // smoke line, so post-match diagnosis needs the full output on disk.
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  const botLogDir = path.join(root, 'logs', 'viewer-bots', stamp);
+  fsNative.mkdirSync(botLogDir, { recursive: true });
   for (const group of groups) {
     const runner = commandFor(group.style, root);
     const child = spawn(runner.command, runner.args, {
@@ -51,8 +56,10 @@ function startLaunch(config) {
       stdio: ['ignore', 'pipe', 'pipe']
     });
     demoProcesses.add(child);
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
+    const logStream = fsNative.createWriteStream(path.join(botLogDir, `${group.label}.log`));
+    child.stdout.on('data', chunk => { collect(chunk); logStream.write(chunk); });
+    child.stderr.on('data', chunk => { collect(chunk); logStream.write(chunk); });
+    child.on('close', () => logStream.end());
     child.on('error', error => {
       failed++;
       demo = { status: 'failed', message: `${group.label} 启动失败：${error.message}` };

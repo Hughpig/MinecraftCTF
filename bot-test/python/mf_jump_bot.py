@@ -332,15 +332,18 @@ class PyJumpBot:
             if ep and ep["x"] * enemy_home_sign > 1:
                 self.enemy_carriers.discard(who)
 
-    def refresh_enemy_flags(self):
+    def refresh_enemy_flags(self, force=False):
         """Live enemy banner cells: broadcast-maintained, reconciled by a
-        bounded scan at most every FLAG_RESCAN_S or when a drop marked it dirty."""
+        bounded scan at most every FLAG_RESCAN_S or when a drop marked it dirty.
+        A forced refresh (the gone-check needs authority now) is rate-limited
+        to one scan per 500ms instead of the 5s staleness window."""
         if not self.team:
             return []
         with flag_state_lock:
             state = flag_state[self.team]
             now = time.time()
-            if state["dirty"] or now - state["scanned_at"] > FLAG_RESCAN_S:
+            forced = force and now - state["scanned_at"] > 0.5
+            if state["dirty"] or forced or now - state["scanned_at"] > FLAG_RESCAN_S:
                 positions = self.scan_enemy_banners()
                 state["enemy"] = {ctf_coord.claim_key(p["x"], p["z"]): {"x": p["x"], "z": p["z"]}
                                   for p in positions}
@@ -614,12 +617,19 @@ class PyJumpBot:
     def is_banner_gone(self, cell):
         # Event-driven: pickup broadcasts remove banners from the live table,
         # so this is a dict lookup instead of a block read every physics tick.
+        # A dirty table (an unannounced capture drop) triggers a rate-limited
+        # rescan right here — answering "still there" blind left bots standing
+        # out a 15s pickup wait.
         if not self.team:
             return False
         with flag_state_lock:
+            dirty = flag_state[self.team]["dirty"]
+        if dirty:
+            self.refresh_enemy_flags(force=True)
+        with flag_state_lock:
             state = flag_state[self.team]
-            if state["scanned_at"] == 0.0 or state["dirty"]:
-                return False  # table unknown or reconciling; the pickup wait decides
+            if state["scanned_at"] == 0.0:
+                return False
             return ctf_coord.claim_key(cell["x"], cell["z"]) not in state["enemy"]
 
     def prune_claims(self):

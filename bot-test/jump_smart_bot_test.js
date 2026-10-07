@@ -593,12 +593,15 @@ function noteEnemyDeposit(bot, message) {
   }
 }
 
-function refreshEnemyFlags(bot) {
+function refreshEnemyFlags(bot, options = {}) {
   // Live enemy banner cells: broadcast-maintained, reconciled by a bounded
-  // scan at most every FLAG_RESCAN_MS or when a drop marked it dirty.
+  // scan at most every FLAG_RESCAN_MS or when a drop marked it dirty. A
+  // forced refresh (the gone-check needs authority now) is rate-limited to
+  // one scan per 500ms instead of the 5s staleness window.
   if (!bot.ctf.team) return [];
   const state = flagState[bot.ctf.team];
-  if (state.dirty || Date.now() - state.scannedAt > FLAG_RESCAN_MS) {
+  const forced = options.force === true && Date.now() - state.scannedAt > 500;
+  if (state.dirty || forced || Date.now() - state.scannedAt > FLAG_RESCAN_MS) {
     const blockName = bot.ctf.team === 'left' ? 'blue_banner' : 'red_banner';
     const block = bot.registry.blocksByName[blockName];
     state.enemy = new Map();
@@ -616,10 +619,13 @@ function refreshEnemyFlags(bot) {
 
 function isBannerGone(bot, position) {
   // Event-driven: pickup broadcasts remove banners from the live table, so
-  // this is a Map lookup instead of a full-half block scan.
+  // this is a Map lookup instead of a full-half block scan. A dirty table
+  // (an unannounced capture drop) triggers a rate-limited rescan right here —
+  // answering "still there" blind left bots standing out a 15s pickup wait.
   if (!bot.ctf.team) return false;
   const state = flagState[bot.ctf.team];
-  if (state.scannedAt === 0 || state.dirty) return false; // unknown; the pickup wait decides
+  if (state.dirty) refreshEnemyFlags(bot, { force: true });
+  if (state.scannedAt === 0) return false;
   return !state.enemy.has(claimKey(position.x, position.z));
 }
 

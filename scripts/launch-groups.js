@@ -9,10 +9,11 @@ const SCRIPTS = {
   smart: { script: 'walk_smart_bot_test.js', runner: 'node' },
   simple: { script: 'local_bot_test.js', runner: 'node' },
   jump: { script: 'jump_smart_bot_test.js', runner: 'node' },
+  spark: { script: 'spark_bot_test.js', runner: 'node' },
   py: { script: 'python/ctf_bot.py', runner: 'python' },
   pyjump: { script: 'python/mf_jump_bot.py', runner: 'python-bridge' }
 };
-const STYLE_LETTERS = { smart: 'S', simple: 'X', jump: 'J', py: 'P', pyjump: 'Y' };
+const STYLE_LETTERS = { smart: 'S', simple: 'X', jump: 'J', spark: 'K', py: 'P', pyjump: 'Y' };
 const STYLES = Object.keys(SCRIPTS);
 
 // Node styles run under the current node binary; the python style needs a
@@ -55,12 +56,12 @@ function commandFor(style, root) {
 
 function parseTeamSpec(spec) {
   // "2:smart,1:simple,1:jump" -> {smart: 2, simple: 1, jump: 1}
-  const counts = { smart: 0, simple: 0, jump: 0, py: 0, pyjump: 0 };
+  const counts = { smart: 0, simple: 0, jump: 0, spark: 0, py: 0, pyjump: 0 };
   for (const part of String(spec || '').split(',')) {
     const trimmed = part.trim();
     if (!trimmed) continue;
-    const match = trimmed.match(/^(\d+):(smart|simple|jump|py|pyjump)$/i);
-    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|jump|simple|py|pyjump，例如 2:smart,1:pyjump`);
+    const match = trimmed.match(/^(\d+):(smart|simple|jump|spark|py|pyjump)$/i);
+    if (!match) throw new Error(`无效的队伍参数 "${trimmed}"，格式为 数量:smart|jump|spark|simple|py|pyjump，例如 2:smart,1:pyjump`);
     counts[match[2].toLowerCase()] += Number(match[1]);
   }
   return counts;

@@ -60,6 +60,12 @@ class BridgeBot:
         # through the bridge, so event-based tracking was always empty.
         self._scan_cache = (0.0, [])          # banner scan (at, positions)
         self.scans = ARENA_SCANS
+        # Resolve the bridge entry points once, here in the quiet construction
+        # phase: a first attribute access during the match-start chat storm can
+        # return None through the proxy and that None sticks in its cache.
+        self._flag_scan_fn = ARENA_SCANS.flags
+        self._goal_scan_fn = ARENA_SCANS.goals
+        self._grid_scan_fn = ARENA_SCANS.grid
         self._probe_cache = {}                # (x, z, level) -> (solid, at)
         self._registry_id = None
         self._lock = threading.Lock()
@@ -149,6 +155,31 @@ class BridgeBot:
             self._registry_id = int(block.id)
         return self._registry_id
 
+    def _scan_fn(self, name, cached):
+        """Bridge scan function by name, preferring the reference resolved at
+        construction; re-resolve once if that stored value went bad."""
+        if callable(cached):
+            return cached
+        fn = getattr(self.scans, name)
+        if callable(fn):
+            return fn
+        return None
+
+    def grid_scan(self, bot):
+        """One-shot arena occupancy grid via the Node-side scan. The JS result
+        object is flattened into a plain Python dict at the bridge boundary —
+        dict.update()/subscript on the raw proxy fails at runtime."""
+        fn = self._scan_fn("grid", self._grid_scan_fn)
+        if fn is None:
+            raise RuntimeError("arena grid scan unavailable through the bridge")
+        self._grid_scan_fn = fn
+        result = fn(bot)
+        return {
+            "x0": int(result.x0),
+            "z0": int(result.z0),
+            "rows": [str(row) for row in result.rows],
+        }
+
     def scan_enemy_banners(self, team):
         """Live enemy banner positions via the bounded Node-side scan (~2ms)."""
         now = time.time()
@@ -156,7 +187,11 @@ class BridgeBot:
             return self._scan_cache[1]
         positions = []
         try:
-            for p in self.scans.flags(self.bot, self.enemy_banner_id(team), team):
+            fn = self._scan_fn("flags", self._flag_scan_fn)
+            if fn is None:
+                raise RuntimeError("banner scan unavailable through the bridge")
+            self._flag_scan_fn = fn
+            for p in fn(self.bot, self.enemy_banner_id(team), team):
                 positions.append({"x": float(p.x), "z": float(p.z)})
         except Exception:
             log.exception("banner scan failed")

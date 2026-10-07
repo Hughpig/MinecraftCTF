@@ -4,6 +4,7 @@
 // otherwise the synchronous Python->Node call deadlocks on the callback.
 const findArenaFlags = require('./arena-flag-search');
 const findArenaGoals = require('./arena-goal-search');
+const scanArenaGrid = require('./arena-grid-scan');
 
 module.exports = {
   flags(bot, blockId, team) {
@@ -13,5 +14,9 @@ module.exports = {
   goals(bot, team) {
     bot.ctf = { team };
     return findArenaGoals(bot);
+  },
+  grid(bot) {
+    bot.ctf = { team: 'left' };
+    return scanArenaGrid(bot);
   }
 };

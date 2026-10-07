@@ -18,6 +18,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from javascript import require  # noqa: E402
 import ctf_coord  # noqa: E402
+import ctf_path  # noqa: E402
 import ctf_steer  # noqa: E402
 import flag_state as flag_state_mod  # noqa: E402
 import mf  # noqa: E402
@@ -53,9 +54,14 @@ log = logging.getLogger("mf-jump")
 stopping = False
 game_ended = False
 stats = {"pickups": 0, "captures": 0, "route_failures": 0}
-scan_stats = {"enemy_scans": 0, "goal_scans": 0}
+scan_stats = {"enemy_scans": 0, "goal_scans": 0, "paths": 0}
 stats_lock = threading.Lock()
 confirm_map_ready = threading.Event()
+
+# One occupancy grid per process, scanned once the arena chunks are proven
+# loaded and reused for every A* leg of every bot.
+grid_cache = {"x0": 0, "z0": 0, "rows": None}
+grid_lock = threading.Lock()
 
 # Team coordination: dynamic flag claims (short leases) and jail/rescue
 # bookkeeping — shared across bot processes via the [CTFC] chat protocol and
@@ -103,6 +109,7 @@ class PyJumpBot:
         self.claimed_key = None
         self.rescue_target = None
         self.rescue_stolen = False
+        self.enemy_carriers = set()
         self.flag_scan = (0.0, [])
         self._gold_id = None
         self.state_waiters = []
@@ -154,8 +161,10 @@ class PyJumpBot:
                     state["goals_dirty"] = True
         if " 夺取了 " in text and "队的一面旗" in text:
             self.note_flag_pickup(text)
+            self.note_enemy_carrier(text)
         if " 队已插旗 " in text:
             self.note_flag_deposit(text)
+            self.note_enemy_deposit(text)
         if "Are you ready?" in text:
             self.bot.chat("I'm ready!")
         if text.startswith("Game start: "):
@@ -201,6 +210,7 @@ class PyJumpBot:
         if not self.team or " 被抓捕并关入 " not in message:
             return
         who = message.split(" 被抓捕并关入")[0].replace("[CTF] ", "").strip()
+        self.enemy_carriers.discard(who)  # a jailed carrier dropped the flag
         with coordination_lock:
             if who not in self.teammates:
                 return
@@ -294,6 +304,34 @@ class PyJumpBot:
             with flag_state_lock:
                 flag_state[self.team]["goals_dirty"] = True
 
+    def note_enemy_carrier(self, message):
+        """Track enemies carrying OUR flag: they score on deposit, and jailing
+        one re-plants the flag deep in our half — the top chase priority."""
+        if not self.team:
+            return
+        own_label = "左" if self.team == "left" else "右"
+        if f"夺取了 {own_label} 队的一面旗" in message:
+            who = message.split(" 夺取了")[0].replace("[CTF] ", "").strip()
+            if who in self.opponents:
+                self.enemy_carriers.add(who)
+
+    def note_enemy_deposit(self, message):
+        if not self.team or not self.enemy_carriers:
+            return
+        enemy_label = "右" if self.team == "left" else "左"
+        if f"{enemy_label} 队已插旗 " not in message:
+            return
+        # The broadcast names no player: resolve by position (the depositor
+        # stands in their own home half) or fall back to the only candidate.
+        if len(self.enemy_carriers) == 1:
+            self.enemy_carriers.clear()
+            return
+        enemy_home_sign = -self.home_sign()
+        for who in list(self.enemy_carriers):
+            ep = self.bot.entity_position(who)
+            if ep and ep["x"] * enemy_home_sign > 1:
+                self.enemy_carriers.discard(who)
+
     def refresh_enemy_flags(self):
         """Live enemy banner cells: broadcast-maintained, reconciled by a
         bounded scan at most every FLAG_RESCAN_S or when a drop marked it dirty."""
@@ -371,20 +409,59 @@ class PyJumpBot:
         own = self.position()
         best = None
         best_distance = max_distance
+        best_carrier = None
+        best_carrier_distance = max_distance
         for username in list(self.opponents):
             ep = self.bot.entity_position(username)
             if not ep or not self.is_home_half(ep):
                 continue
             distance = math.hypot(ep["x"] - own["x"], ep["z"] - own["z"])
-            if distance < best_distance and abs(ep.get("y", 64) - own.get("y", 64)) <= 2.5:
+            if abs(ep.get("y", 64) - own.get("y", 64)) > 2.5:
+                continue
+            if username in self.enemy_carriers:
+                if distance < best_carrier_distance:
+                    best_carrier = {"username": username, "x": ep["x"], "z": ep["z"]}
+                    best_carrier_distance = distance
+            elif distance < best_distance:
                 best = {"username": username, "x": ep["x"], "z": ep["z"]}
                 best_distance = distance
-        return best
+        # A carrier scores the moment they deposit: intercepting one beats
+        # any loiterer, whatever the distance gap.
+        return best_carrier or best
 
     def entity_by_name(self, username):
         return self.bot.entity_position(username)
 
     # -- movement ------------------------------------------------------------
+
+    def arena_grid(self):
+        """One-shot occupancy grid for the whole arena, shared by every bot of
+        this process. None until the arena walls prove the chunks loaded."""
+        with grid_lock:
+            if grid_cache["rows"] is not None:
+                return grid_cache
+            # The stone-brick wall at x=24 doubles as the loaded-chunks canary:
+            # before it streams in, getBlockType reads unloaded chunks as air.
+            if self.bot.block_is_air(24, 64, 0) is not False:
+                return None
+            try:
+                grid_cache.update(self.bot.grid_scan(self.bot.bot))
+            except Exception:
+                log.exception("arena grid scan failed")
+                return None
+            return grid_cache
+
+    def plan_path(self, x, z):
+        """A* waypoints to (x, z), or None when the grid is not ready yet."""
+        grid = self.arena_grid()
+        if not grid:
+            return None
+        position = self.position()
+        with stats_lock:
+            scan_stats["paths"] += 1
+        return ctf_path.find_path(grid["rows"], (grid["x0"], grid["z0"]),
+                                  (int(round(position["x"])), int(round(position["z"]))),
+                                  (int(round(x)), int(round(z))))
 
     def go_near(self, x, z, completed=None, options=None):
         options = options or {}
@@ -394,6 +471,7 @@ class PyJumpBot:
         max_duration = options.get("maxDuration", 20.0)
         dodge_players = options.get("dodgePlayers", True)
         no_detour = options.get("noDetour", False)
+        use_path = options.get("plan", False)
         target = {"x": x, "z": z}
         last_x = last_z = None
         last_progress = time.time()
@@ -407,6 +485,9 @@ class PyJumpBot:
         unstick_until = 0.0
         unstick_point = None
         was_jailed = False
+        waypoints = self.plan_path(x, z) if use_path else None
+        waypoint_index = 0
+        replans = 0
         while not stopping and time.time() - started < max_duration:
             if completed():
                 self.bot.clear_controls()
@@ -448,10 +529,28 @@ class PyJumpBot:
                     unstick_until = time.time() + 1.2
                     detour = None
                     stall_count = 0
+                    if use_path and replans < 2:
+                        # The planned route led into a wedge: replan from here.
+                        replanned = self.plan_path(x, z)
+                        if replanned:
+                            waypoints = replanned
+                            waypoint_index = 0
+                            replans += 1
             if unstick_until > time.time() and unstick_point:
                 steer_point = unstick_point
             else:
-                result = ctf_steer.plan_steer(position, target, detour, self.bot.probe)
+                # A* supplies the global route; steering toward the next
+                # waypoint keeps the probe-based local avoidance as a backstop.
+                steer_target = target
+                if waypoints:
+                    while waypoint_index < len(waypoints) and math.hypot(
+                            waypoints[waypoint_index][0] - position["x"],
+                            waypoints[waypoint_index][1] - position["z"]) < 1.2:
+                        waypoint_index += 1
+                    if waypoint_index < len(waypoints):
+                        steer_target = {"x": waypoints[waypoint_index][0],
+                                        "z": waypoints[waypoint_index][1]}
+                result = ctf_steer.plan_steer(position, steer_target, detour, self.bot.probe)
                 detour = result["detour"]
                 steer_point = result["steer_point"]
             steer_dx = steer_point["x"] - position["x"]
@@ -616,8 +715,11 @@ class PyJumpBot:
         try:
             # NB: pass the mineflayer proxy (self.bot.bot), not the Python
             # wrapper — Node calls bot.world.* natively on it during the scan.
-            return [{"x": float(p.x), "z": float(p.z)}
-                    for p in self.bot.scans.goals(self.bot.bot, self.team)]
+            fn = self.bot._scan_fn("goals", self.bot._goal_scan_fn)
+            if fn is None:
+                raise RuntimeError("goal scan unavailable through the bridge")
+            self.bot._goal_scan_fn = fn
+            return [{"x": float(p.x), "z": float(p.z)} for p in fn(self.bot.bot, self.team)]
         except Exception:
             log.exception("goal scan failed")
             return []
@@ -707,7 +809,7 @@ class PyJumpBot:
                     return True
                 ent = self.entity_by_name(target)
                 return (ent and not is_in_prison_cell(ent)) or self.jailed
-            self.go_near(plate["x"], plate["z"], completed=arrived, options={"maxDuration": 25})
+            self.go_near(plate["x"], plate["z"], completed=arrived, options={"plan": True, "maxDuration": 25})
             # Hold the plate until the door opens, then LEAVE immediately —
             # the freed teammate walks out through the open door themselves,
             # and lingering here just blocks the doorway.
@@ -749,14 +851,15 @@ class PyJumpBot:
                 return
             if opponent["username"] != last_target:
                 last_target = opponent["username"]
-                log.info("%s defend chase %s", self.username, last_target)
+                tag = " (carrier)" if last_target in self.enemy_carriers else ""
+                log.info("%s defend chase %s%s", self.username, last_target, tag)
             try:
                 def completed():
                     current = self.bot.entity_position(last_target)
                     return current is None or not self.is_home_half(current) or self.jailed
                 self.go_near(opponent["x"], opponent["z"],
                              completed=completed,
-                             options={"dodgePlayers": False, "maxDuration": 3})
+                             options={"plan": True, "dodgePlayers": False, "maxDuration": 3})
             except RuntimeError:
                 self.bot.clear_controls()
                 time.sleep(0.1)
@@ -774,7 +877,7 @@ class PyJumpBot:
             x, z = waypoints[index % len(waypoints)]
             index += 1
             free = ctf_steer.nearest_free_cell(self.bot.probe, x, z)
-            self.go_near(free["x"], free["z"], completed=lambda: bool(self.nearest_home_opponent()))
+            self.go_near(free["x"], free["z"], completed=lambda: bool(self.nearest_home_opponent()), options={"plan": True})
             if self.nearest_home_opponent():
                 self.chase_home_opponent()
 
@@ -844,11 +947,12 @@ class PyJumpBot:
                     flag = {"x": chosen["x"] + sign * FLAG_APPROACH_OFFSET, "z": chosen["z"] + 0.3,
                             "bx": chosen["x"], "bz": chosen["z"]}
                     log.info("%s go flag %.1f,%.1f (claimed)", self.username, flag["x"], flag["z"])
-                    self.go_near(sign * 2, self.position()["z"])
-                    self.go_near(sign * 2, flag["z"])
+                    self.go_near(sign * 2, self.position()["z"], options={"plan": True})
+                    self.go_near(sign * 2, flag["z"], options={"plan": True})
                     flag_target = {"x": flag["bx"], "z": flag["bz"]}
                     self.go_near(flag["x"], flag["z"],
-                                 completed=lambda: self.carrying or self.is_banner_gone(flag_target))
+                                 completed=lambda: self.carrying or self.is_banner_gone(flag_target),
+                                 options={"plan": True})
                     # The banner can vanish between arrival and the server's
                     # pickup confirm; poll with a live gone-check.
                     if not self.wait_for(lambda: self.carrying or self.is_banner_gone(flag_target), 15):
@@ -864,7 +968,8 @@ class PyJumpBot:
                     goal_target = dict(goal)
                     self.go_near(goal["x"] + sign * 0.3, goal["z"] + 0.3,
                                  completed=lambda: self.captures_count > previous_captures
-                                 or not self.carrying or self.is_goal_locked(goal_target))
+                                 or not self.carrying or self.is_goal_locked(goal_target),
+                                 options={"plan": True})
                     captured = self.captures_count > previous_captures
                     if not captured and not stopping:
                         log.info("%s flag lost after capture; retrying after release", self.username)
@@ -877,7 +982,8 @@ class PyJumpBot:
                         try:
                             goal = self.wait_for_home_goal()
                             self.go_near(goal["x"] + sign * 0.3, goal["z"] + 0.3,
-                                         completed=lambda: not self.carrying, options={"maxDuration": 10})
+                                         completed=lambda: not self.carrying,
+                                         options={"plan": True, "maxDuration": 10})
                         except RuntimeError:
                             self.bot.clear_controls()
                     log.info("%s route attempt %d/4 failed: %s", self.username, attempts, error)
@@ -910,7 +1016,8 @@ def stop_all():
           f"captures={stats['captures']}, routeFailures={failures}, gameEnded={bool(stats.get('game_ended'))}",
           flush=True)
     print(f"[smoke] scans: enemyScans={scan_stats['enemy_scans']}, "
-          f"goalScans={scan_stats['goal_scans']}, blockReads={mf.BLOCK_READ_STATS['count']}", flush=True)
+          f"goalScans={scan_stats['goal_scans']}, blockReads={mf.BLOCK_READ_STATS['count']}, "
+          f"paths={scan_stats['paths']}", flush=True)
     global exit_code
     exit_code = 0 if process_passed else 1
     for bot in bots:

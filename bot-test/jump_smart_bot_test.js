@@ -7,6 +7,8 @@ const waitForInitialWorld = require('./startup-world');
 const { planSteer, strafeSideForAway, makeBlockProbe, nearestFreeCell } = require('./ctf-steer');
 const { CHAT_PREFIX, parseCoordination, claimKey, claimMessage, unclaimMessage, rescueMessage, freedMessage } = require('./ctf-coord');
 const { takeNearest } = require('./flag-state');
+const { findPath } = require('./ctf-path');
+const scanArenaGrid = require('./arena-grid-scan');
 
 const HOST = process.env.CTF_HOST || '127.0.0.1';
 const PORT = Number(process.env.CTF_PORT || 25565);
@@ -45,8 +47,12 @@ const log = (name, message) => console.log(`[${new Date().toISOString()}] [${nam
 const CLAIM_LEASE_MS = 15000;
 const JAIL_ENTRY_TIMEOUT_MS = 32000; // past 30s the timer opens the door anyway
 const RESCUE_LEASE_MS = 25000;       // matches the plate walk + hold budget
-const scanStats = { enemyScans: 0, goalScans: 0, goalLockReads: 0 };
+const scanStats = { enemyScans: 0, goalScans: 0, goalLockReads: 0, paths: 0 };
 const FLAG_RESCAN_MS = 5000; // reconciliation safety net for missed events (e.g. a quitting carrier)
+
+// One occupancy grid per process, scanned once the arena chunks are proven
+// loaded and reused for every A* leg of every bot.
+const gridCache = { grid: null };
 
 // Broadcast-maintained banner/goal tables, one per team per process: every
 // pickup/deposit/jail broadcast mutates them, so route code consults a Map
@@ -118,8 +124,9 @@ function noteJail(bot, message) {
   // A jailed rescuer cannot reach the plate: their epoch is dead and someone
   // else must be able to claim the rescue.
   if (c.rescue && c.rescue.by === who) c.rescue = null;
-  // If they were carrying, their flag re-planted at an unannounced spot: the
-  // banner table needs a fresh scan.
+  // A jailed carrier dropped the flag: stop prioritising them, and if they
+  // were carrying, the re-plant spot is unannounced — rescan.
+  bot.ctf.enemyCarriers.delete(who);
   flagState[bot.ctf.team].dirty = true;
 }
 
@@ -211,7 +218,7 @@ async function rescueTeammate(bot) {
       if (rescueTakenOver(bot, c) || !c.jailed.has(target)) return true;
       const ent = entityByUsername(bot, target);
       return (!!ent && !isInPrisonCell(ent.position)) || bot.ctf.jailed;
-    }, { maxDuration: 25000 });
+    }, { plan: true, maxDuration: 25000 });
     // Stand on the plate until the teammate actually walks out of the cell
     // (rescue or the 30s timer) — the plugin teleports them outside either
     // way. Entity position, not door state, is the source of truth here: a
@@ -240,7 +247,7 @@ async function rescueTeammate(bot) {
 function makeBot(index) {
   const username = `${NAME_PREFIX}_${index + 1}`;
   const bot = mineflayer.createBot({ host: HOST, port: PORT, username, auth: 'offline', version: '1.21.8', viewDistance: VIEW_DISTANCE });
-  bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, rescueTarget: null, rescueStolen: false, claimedKey: null, pickups: 0, captures: 0, opponents: new Set() };
+  bot.ctf = { index, team: null, started: false, routeRunning: false, routeFailed: false, carrying: false, jailed: false, rescueTarget: null, rescueStolen: false, claimedKey: null, enemyCarriers: new Set(), pickups: 0, captures: 0, opponents: new Set() };
 
   bot.once('spawn', () => {
     log(username, `connected to ${HOST}:${PORT}`);
@@ -259,9 +266,13 @@ function makeBot(index) {
         state.goals.clear(); state.goalsDirty = true;
       }
     }
-    if (message.includes(' 夺取了 ') && message.includes('队的一面旗')) noteFlagPickup(bot, message);
+    if (message.includes(' 夺取了 ') && message.includes('队的一面旗')) {
+      noteFlagPickup(bot, message);
+      noteEnemyCarrier(bot, message);
+    }
     if (bot.ctf.team && message.includes(`${bot.ctf.team === 'left' ? '左' : '右'} 队已插旗 `)) {
       flagState[bot.ctf.team].goalsDirty = true;
+      noteEnemyDeposit(bot, message);
     }
     if (message.includes('Are you ready?')) bot.chat("I'm ready!");
     if (message.startsWith('Game start: ')) {
@@ -347,6 +358,24 @@ function homeSign(bot) {
   return bot.ctf.team === 'left' ? -1 : 1;
 }
 
+function arenaGrid(bot) {
+  // The stone-brick wall at x=24 doubles as the loaded-chunks canary: before
+  // it streams in, getBlockType reads unloaded chunks as air.
+  if (gridCache.grid) return gridCache.grid;
+  if (!bot.world || bot.world.getBlockType(new Vec3(24, 64, 0)) === 0) return null;
+  gridCache.grid = scanArenaGrid(bot);
+  return gridCache.grid;
+}
+
+function planPath(bot, x, z) {
+  const grid = arenaGrid(bot);
+  if (!grid || !bot.entity) return null;
+  scanStats.paths++;
+  return findPath(grid.rows, [grid.x0, grid.z0],
+    [Math.round(bot.entity.position.x), Math.round(bot.entity.position.z)],
+    [Math.round(x), Math.round(z)]);
+}
+
 function isHomeHalf(bot, position) {
   return !!position && position.x * homeSign(bot) > 1;
 }
@@ -355,16 +384,26 @@ function nearestHomeOpponent(bot, maxDistance = 96) {
   if (!bot.entity || !bot.ctf.team) return null;
   let nearest = null;
   let nearestDistance = maxDistance;
+  let nearestCarrier = null;
+  let nearestCarrierDistance = maxDistance;
   for (const entity of Object.values(bot.entities || {})) {
     if (entity.type !== 'player' || !entity.username || !bot.ctf.opponents.has(entity.username)) continue;
     if (!isHomeHalf(bot, entity.position)) continue;
     const distance = Math.hypot(entity.position.x - bot.entity.position.x, entity.position.z - bot.entity.position.z);
-    if (distance < nearestDistance && Math.abs(entity.position.y - bot.entity.position.y) <= 2.5) {
+    if (Math.abs(entity.position.y - bot.entity.position.y) > 2.5) continue;
+    if (bot.ctf.enemyCarriers.has(entity.username)) {
+      if (distance < nearestCarrierDistance) {
+        nearestCarrier = entity;
+        nearestCarrierDistance = distance;
+      }
+    } else if (distance < nearestDistance) {
       nearest = entity;
       nearestDistance = distance;
     }
   }
-  return nearest;
+  // A carrier scores the moment they deposit: intercepting one beats any
+  // loiterer, whatever the distance gap.
+  return nearestCarrier || nearest;
 }
 
 async function goNear(bot, x, z, completed = () => false, options = {}) {
@@ -387,8 +426,12 @@ async function goNear(bot, x, z, completed = () => false, options = {}) {
   const maxDuration = options.maxDuration || 20000;
   const dodgePlayers = options.dodgePlayers !== false;
   const noDetour = options.noDetour === true;
+  const usePath = options.plan === true;
   const target = new Vec3(x, 64, z);
   const probe = makeBlockProbe(bot);
+  let waypoints = usePath && bot.entity ? planPath(bot, x, z) : null;
+  let waypointIndex = 0;
+  let replans = 0;
   while (!stopping && Date.now() - started < maxDuration) {
     if (completed()) { bot.clearControlStates(); return true; }
     if (bot.ctf.jailed) {
@@ -429,13 +472,34 @@ async function goNear(bot, x, z, completed = () => false, options = {}) {
         unstickUntil = Date.now() + 1200;
         detour = null;
         stallCount = 0;
+        if (usePath && replans < 2) {
+          // The planned route led into a wedge: replan from here.
+          const replanned = planPath(bot, x, z);
+          if (replanned) {
+            waypoints = replanned;
+            waypointIndex = 0;
+            replans++;
+          }
+        }
       }
     }
     let steerPoint;
     if (unstickUntil > Date.now() && unstickPoint) {
       steerPoint = unstickPoint;
     } else {
-      const steer = planSteer({ position, target, detour, probe });
+      // A* supplies the global route; steering toward the next waypoint keeps
+      // the probe-based local avoidance as a backstop.
+      let steerGoal = target;
+      if (waypoints) {
+        while (waypointIndex < waypoints.length
+            && Math.hypot(waypoints[waypointIndex][0] - position.x, waypoints[waypointIndex][1] - position.z) < 1.2) {
+          waypointIndex++;
+        }
+        if (waypointIndex < waypoints.length) {
+          steerGoal = new Vec3(waypoints[waypointIndex][0], 64, waypoints[waypointIndex][1]);
+        }
+      }
+      const steer = planSteer({ position, target: steerGoal, detour, probe });
       detour = steer.detour;
       steerPoint = steer.steerPoint;
     }
@@ -500,6 +564,33 @@ function noteFlagPickup(bot, message) {
   const at = ent ? ent.position : bot.entity ? bot.entity.position : null;
   if (at) takeNearest(state.enemy, at.x, at.z);
   else state.dirty = true; // picker out of view: rescan to find the gap
+}
+
+function noteEnemyCarrier(bot, message) {
+  // Track enemies carrying OUR flag: they score on deposit, and jailing one
+  // re-plants the flag deep in our half — the top chase priority.
+  if (!bot.ctf.team) return;
+  const ownLabel = bot.ctf.team === 'left' ? '左' : '右';
+  if (!message.includes(`夺取了 ${ownLabel} 队的一面旗`)) return;
+  const who = message.split(' 夺取了')[0].replace('[CTF] ', '').trim();
+  if (bot.ctf.opponents.has(who)) bot.ctf.enemyCarriers.add(who);
+}
+
+function noteEnemyDeposit(bot, message) {
+  if (!bot.ctf.team || bot.ctf.enemyCarriers.size === 0) return;
+  const enemyLabel = bot.ctf.team === 'left' ? '右' : '左';
+  if (!message.includes(`${enemyLabel} 队已插旗 `)) return;
+  // The broadcast names no player: resolve by position (the depositor stands
+  // in their own home half) or fall back to the only candidate.
+  if (bot.ctf.enemyCarriers.size === 1) {
+    bot.ctf.enemyCarriers.clear();
+    return;
+  }
+  const enemyHomeSign = bot.ctf.team === 'left' ? 1 : -1;
+  for (const who of [...bot.ctf.enemyCarriers]) {
+    const ent = entityByUsername(bot, who);
+    if (ent && ent.position.x * enemyHomeSign > 1) bot.ctf.enemyCarriers.delete(who);
+  }
 }
 
 function refreshEnemyFlags(bot) {
@@ -663,14 +754,15 @@ async function chaseHomeOpponent(bot, options = {}) {
     if (!opponent) return;
     if (opponent.username !== lastTarget) {
       lastTarget = opponent.username;
-      log(bot.username, `defend chase ${opponent.username}`);
+      const tag = bot.ctf.enemyCarriers.has(lastTarget) ? ' (carrier)' : '';
+      log(bot.username, `defend chase ${lastTarget}${tag}`);
     }
     const targetId = opponent.entityId;
     try {
       await goNear(bot, opponent.position.x, opponent.position.z, () => {
         const current = entityByUsername(bot, opponent.username);
         return !current || current.entityId !== targetId || !isHomeHalf(bot, current.position) || bot.ctf.jailed;
-      }, { dodgePlayers: false, maxDuration: 3000 });
+      }, { plan: true, dodgePlayers: false, maxDuration: 3000 });
     } catch (_) {
       bot.clearControlStates();
       await sleep(100);
@@ -694,7 +786,7 @@ async function patrolAfterRoute(bot) {
     // free cell instead of pushing into the trunk forever.
     const [x, z] = waypoints[index++ % waypoints.length];
     const free = nearestFreeCell(probe, x, z);
-    await goNear(bot, free.x, free.z, () => !!nearestHomeOpponent(bot));
+    await goNear(bot, free.x, free.z, () => !!nearestHomeOpponent(bot), { plan: true });
     if (nearestHomeOpponent(bot)) await chaseHomeOpponent(bot);
   }
 }
@@ -713,7 +805,7 @@ async function runDefenderRoute(bot) {
     if (maybeClaimRescue(bot)) { await rescueTeammate(bot); continue; }
     const [x, z] = waypoints[index++ % waypoints.length];
     const free = nearestFreeCell(probe, x, z);
-    await goNear(bot, free.x, free.z, () => !!nearestHomeOpponent(bot));
+    await goNear(bot, free.x, free.z, () => !!nearestHomeOpponent(bot), { plan: true });
     if (nearestHomeOpponent(bot)) await chaseHomeOpponent(bot);
   }
 }
@@ -772,13 +864,13 @@ async function runAttackerRoute(bot) {
         const chosen = claimEnemyFlag(bot, positions);
         const flag = { x: chosen.x + sign * FLAG_APPROACH_OFFSET, z: chosen.z + 0.3, bx: chosen.x, bz: chosen.z };
         log(bot.username, `go flag ${flag.x.toFixed(1)},${flag.z.toFixed(1)} (claimed)`);
-        await goNear(bot, sign * 2, bot.entity.position.z);
-        await goNear(bot, sign * 2, flag.z);
+        await goNear(bot, sign * 2, bot.entity.position.z, () => false, { plan: true });
+        await goNear(bot, sign * 2, flag.z, () => false, { plan: true });
         // If a teammate grabs this banner first it vanishes from the world —
         // bail out immediately and let the retry claim the next nearest flag
         // instead of walking to an empty spot for the full timeout.
         const flagTarget = { x: flag.bx, z: flag.bz };
-        await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying || isBannerGone(bot, flagTarget));
+        await goNear(bot, flag.x, flag.z, () => bot.ctf.carrying || isBannerGone(bot, flagTarget), { plan: true });
         // The banner can vanish (a teammate or opponent grabs it) between
         // arrival and the server's pickup confirm; without a live check the
         // bot would stand here as capture bait for the whole 15s timeout.
@@ -791,7 +883,7 @@ async function runAttackerRoute(bot) {
         const previousCaptures = bot.ctf.captures;
         const goalTarget = { x: goal.x, z: goal.z };
         await goNear(bot, goal.x + sign * 0.3, goal.z + 0.3,
-          () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying || isGoalLocked(bot, goalTarget));
+          () => bot.ctf.captures > previousCaptures || !bot.ctf.carrying || isGoalLocked(bot, goalTarget), { plan: true });
         captured = bot.ctf.captures > previousCaptures;
         if (!captured && !stopping) log(bot.username, 'flag lost after capture; retrying after release');
       } catch (err) {
@@ -803,7 +895,7 @@ async function runAttackerRoute(bot) {
         if (bot.ctf.carrying) {
           try {
             const goal = await waitForHomeGoal(bot);
-            await goNear(bot, goal.x + sign * 0.3, goal.z + 0.3, () => !bot.ctf.carrying, { maxDuration: 10000 });
+            await goNear(bot, goal.x + sign * 0.3, goal.z + 0.3, () => !bot.ctf.carrying, { plan: true, maxDuration: 10000 });
           } catch (_) { bot.clearControlStates(); }
         }
         log(bot.username, `route attempt ${attempts}/4 failed: ${err.message}`);
@@ -832,7 +924,7 @@ function stopAll() {
   const passed = gameEnded && pickups > 0 && captures > 0;
   process.exitCode = passed ? 0 : 1;
   log('smoke', `${passed ? 'PASS' : 'FAIL'}: pickups=${pickups}, captures=${captures}, routeFailures=${routeFailures}, gameEnded=${gameEnded}`);
-  log('smoke', `scans: enemyScans=${scanStats.enemyScans}, goalScans=${scanStats.goalScans}, goalLockReads=${scanStats.goalLockReads}`);
+  log('smoke', `scans: enemyScans=${scanStats.enemyScans}, goalScans=${scanStats.goalScans}, goalLockReads=${scanStats.goalLockReads}, paths=${scanStats.paths}`);
   for (const bot of bots) {
     try { bot.clearControlStates(); bot.quit('local CTF smoke test finished'); } catch (_) {}
   }

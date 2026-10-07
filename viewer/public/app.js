@@ -27,7 +27,7 @@ const elements = Object.fromEntries([
   'phase', 'timer', 'result-text', 'perspective-badge', 'perspective-title', 'red-view', 'blue-view',
   'show-labels', 'map-overlay', 'overlay-title', 'overlay-text', 'hover-info', 'snapshot-age',
   'start-demo', 'demo-status', 'player-list', 'player-count', 'event-list',
-  'launch-btn', 'stop-btn', 'launch-mode', 'red-smart', 'red-jump', 'red-simple', 'red-py', 'red-pyjump', 'blue-smart', 'blue-jump', 'blue-simple', 'blue-py', 'blue-pyjump',
+  'launch-btn', 'stop-btn', 'launch-mode', 'red-smart', 'red-jump', 'red-spark', 'red-simple', 'red-py', 'red-pyjump', 'blue-smart', 'blue-jump', 'blue-spark', 'blue-simple', 'blue-py', 'blue-pyjump',
   'map-mode', 'map-obstacles', 'map-stands', 'map-seed'
 ].map(id => [id, document.getElementById(id)]));
 const colors = { left: '#f24d62', right: '#2689ee', spectator: '#8994a6' };
@@ -608,8 +608,8 @@ function readLaunchConfig() {
   const count = id => Math.max(0, Math.min(8, Number(elements[id].value) || 0));
   return {
     mode: elements['launch-mode'].value,
-    red: { smart: count('red-smart'), jump: count('red-jump'), simple: count('red-simple'), py: count('red-py'), pyjump: count('red-pyjump') },
-    blue: { smart: count('blue-smart'), jump: count('blue-jump'), simple: count('blue-simple'), py: count('blue-py'), pyjump: count('blue-pyjump') },
+    red: { smart: count('red-smart'), jump: count('red-jump'), spark: count('red-spark'), simple: count('red-simple'), py: count('red-py'), pyjump: count('red-pyjump') },
+    blue: { smart: count('blue-smart'), jump: count('blue-jump'), spark: count('blue-spark'), simple: count('blue-simple'), py: count('blue-py'), pyjump: count('blue-pyjump') },
     map: {
       mode: elements['map-mode'].value,
       obstacles: elements['map-obstacles'].value,
@@ -644,7 +644,7 @@ elements['stop-btn'].addEventListener('click', async () => {
 
 elements['launch-mode'].addEventListener('change', () => {
   const single = elements['launch-mode'].value === 'red';
-  for (const id of ['blue-smart', 'blue-jump', 'blue-simple', 'blue-py', 'blue-pyjump']) elements[id].disabled = single;
+  for (const id of ['blue-smart', 'blue-jump', 'blue-spark', 'blue-simple', 'blue-py', 'blue-pyjump']) elements[id].disabled = single;
 });
 canvas.addEventListener('mousemove', event => {
   if (!geometry || !envelope.snapshot?.mapBuilt) return;
